@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NIRUTERM
+GenericName=Terminal
+Comment=Fast, light terminal of the NIRU suite
+Exec=niruterm
+Icon=niruterm
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+Keywords=terminal;shell;console;command;prompt;
+StartupWMClass=niruterm

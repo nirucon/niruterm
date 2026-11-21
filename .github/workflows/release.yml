@@ -1,0 +1,45 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: rustfmt, clippy
+      - name: Install musl and X11 test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools xvfb xdotool x11-utils imagemagick fonts-dejavu-core
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked -- --test-threads=1
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Verify release identity and a static binary
+        run: |
+          B=target/x86_64-unknown-linux-musl/release/niruterm
+          test "$($B --version | awk '{print $2}')" = "${GITHUB_REF_NAME#v}"
+          if ldd $B 2>&1 | grep -q '=>'; then echo "::error::niruterm is dynamically linked"; exit 1; fi
+          sh tests/xvfb.sh $B
+      - name: Collect assets
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/niruterm target/x86_64-unknown-linux-musl/release/niruprompt assets/niruterm.desktop assets/niruterm.svg dist/
+          cd dist && sha256sum niruterm niruprompt niruterm.desktop niruterm.svg > SHA256SUMS && cat SHA256SUMS
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          make_latest: true
+          files: |
+            dist/niruterm
+            dist/niruprompt
+            dist/niruterm.desktop
+            dist/niruterm.svg
+            dist/SHA256SUMS
+          generate_release_notes: true
