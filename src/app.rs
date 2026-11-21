@@ -385,6 +385,7 @@ impl App {
                 let _ = self.x.answer_text(&e, &text);
             }
             Event::SelectionNotify(e) => self.got_selection(e.property, e.selection),
+            Event::MappingNotify(e) if e.request != Mapping::POINTER => self.x.reload_keymap(),
             Event::KeyPress(e) => self.key(e.detail, e.state),
             Event::ButtonPress(e) => {
                 self.button(e.detail, e.event_x as i32, e.event_y as i32, e.state, true)

@@ -59,7 +59,7 @@ pub struct X {
     shm_ok: bool,
     min_keycode: u8,
     per: u8,
-    keysyms: Vec<u32>,
+    pub keysyms: Vec<u32>,
 }
 
 fn atom(c: &RustConnection, name: &str) -> Res<Atom> {
@@ -254,6 +254,21 @@ impl X {
             .ok()?;
         let s = String::from_utf8(r.value).ok()?;
         (!s.is_empty()).then_some(s)
+    }
+
+    /// Read the keyboard map again (a layout change, MappingNotify).
+    pub fn reload_keymap(&mut self) {
+        let setup = self.c.setup();
+        let (min, max) = (setup.min_keycode, setup.max_keycode);
+        if let Ok(Ok(map)) = self
+            .c
+            .get_keyboard_mapping(min, max - min + 1)
+            .map(|c| c.reply())
+        {
+            self.min_keycode = min;
+            self.per = map.keysyms_per_keycode;
+            self.keysyms = map.keysyms;
+        }
     }
 
     /// The keysym of a key, with Shift (column 1) or AltGr (columns 4/5).
