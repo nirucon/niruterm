@@ -1,0 +1,22 @@
+[package]
+name = "niruterm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+description = "Fast, light terminal of the NIRU suite, with images and the NIRUX theme"
+default-run = "niruterm"
+
+[dependencies]
+alacritty_terminal = "0.26"
+x11rb = { version = "0.13", features = ["shm"] }
+ab_glyph = "0.2"
+png = "0.17"
+toml = "0.8"
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
