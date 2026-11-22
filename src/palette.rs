@@ -148,13 +148,43 @@ fn kitty_font_size() -> Option<f32> {
         .next_back()
 }
 
+/// kitty's `shell` when NIRUTERM has none: NIRUX starts fish in kitty while
+/// the login shell is often bash, and the switch should keep the same shell.
+/// `.` (kitty's "the login shell"), a command line with arguments, or a shell
+/// that is not installed leaves the login shell.
+fn kitty_shell() -> Option<String> {
+    let text = std::fs::read_to_string(config_home().join("kitty/kitty.conf")).ok()?;
+    let value = text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("shell "))
+        .map(str::trim)
+        .next_back()?
+        .to_string();
+    kitty_shell_choice(&value, |name| {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+    })
+}
+
+fn kitty_shell_choice(value: &str, installed: impl Fn(&str) -> bool) -> Option<String> {
+    if value.is_empty() || value == "." || value.contains(char::is_whitespace) {
+        return None;
+    }
+    let present = if value.contains('/') {
+        std::path::Path::new(value).is_file()
+    } else {
+        installed(value)
+    };
+    present.then(|| value.to_string())
+}
+
 pub fn settings() -> Settings {
     let mut s = Settings {
         font: None,
         font_size: kitty_font_size().unwrap_or(12.0),
         padding: 10,
         line_height: 1.0,
-        shell: None,
+        shell: kitty_shell(),
         scrollback: 10_000,
         copy_on_select: true,
         cursor_blink: false,
@@ -227,6 +257,17 @@ pub fn indexed(p: &Palette, i: u8) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shell_follows_kitty_when_it_is_installed() {
+        let yes = |_: &str| true;
+        let no = |_: &str| false;
+        assert_eq!(kitty_shell_choice("fish", yes).as_deref(), Some("fish"));
+        assert_eq!(kitty_shell_choice("fish", no), None);
+        assert_eq!(kitty_shell_choice(".", yes), None);
+        assert_eq!(kitty_shell_choice("fish --login", yes), None);
+        assert_eq!(kitty_shell_choice("/nonexistent/fish", yes), None);
+    }
 
     #[test]
     fn a_nirux_theme_file_sets_the_palette() {
