@@ -35,6 +35,7 @@ fn main() {
     let started = std::time::Instant::now();
     let mut args = std::env::args().skip(1).peekable();
     let mut spawn = term::Spawn {
+        shell_env: None,
         program: None,
         args: Vec::new(),
         dir: None,
@@ -98,6 +99,10 @@ fn main() {
     spawn.scrollback = settings.scrollback;
     if spawn.program.is_none() {
         spawn.program = settings.shell.clone();
+        // The shell inside is the one NIRUTERM chose (kitty's fish), so
+        // programs that ask $SHELL (nirufetch, vim's :shell) see that one
+        // and not the login shell, as in kitty.
+        spawn.shell_env = spawn.program.as_deref().and_then(shell_path);
     }
     match app::App::new(spawn, opts, started).and_then(|mut a| a.run()) {
         Ok(()) => {}
@@ -106,4 +111,18 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// The full path of a shell given by name or path.
+fn shell_path(name: &str) -> Option<String> {
+    if name.contains('/') {
+        return std::path::Path::new(name)
+            .is_file()
+            .then(|| name.to_string());
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
 }

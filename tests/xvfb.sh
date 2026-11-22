@@ -75,4 +75,16 @@ xdotool key Return
 sleep 0.6
 if kill -0 "$H" 2>/dev/null; then fail 'a key did not close the held window'; fi
 echo "class, hold and kitty-style command ok"
+# The chosen shell is also SHELL inside (nirufetch and others read it).
+mkdir -p "$XDG_CONFIG_HOME/niruterm"
+printf 'shell = "sh"\n' > "$XDG_CONFIG_HOME/niruterm/config.toml"
+SHELL=/bin/false "$BIN" 2>>"$SB/err" &
+S=$!
+PIDS="$PIDS $S"
+sleep 1.2
+xdotool mousemove 300 300
+k 'printf %s "$SHELL" > '"$SB"'/shellvar'
+case "$(cat "$SB/shellvar" 2>/dev/null)" in */sh) ;; *) fail "SHELL inside is '$(cat "$SB/shellvar" 2>/dev/null)'" ;; esac
+k exit
+echo "chosen shell is SHELL ok"
 echo PASS

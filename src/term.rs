@@ -120,6 +120,8 @@ impl Dimensions for GridSize {
 }
 
 pub struct Spawn {
+    /// `SHELL` for the programs inside, when NIRUTERM runs a chosen shell.
+    pub shell_env: Option<String>,
     pub program: Option<String>,
     pub args: Vec<String>,
     pub dir: Option<std::path::PathBuf>,
@@ -142,6 +144,9 @@ impl Session {
             "TERM_PROGRAM_VERSION".to_string(),
             env!("CARGO_PKG_VERSION").to_string(),
         );
+        if let Some(sh) = spawn.shell_env {
+            env.insert("SHELL".to_string(), sh);
+        }
         let shell = spawn.program.map(|p| Shell::new(p, spawn.args));
         let opts = Options {
             shell,
