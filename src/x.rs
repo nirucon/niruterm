@@ -67,7 +67,7 @@ fn atom(c: &RustConnection, name: &str) -> Res<Atom> {
 }
 
 impl X {
-    pub fn open(w: u16, h: u16, title: &str) -> Res<Self> {
+    pub fn open(w: u16, h: u16, title: &str, class: &str) -> Res<Self> {
         let (c, screen) = x11rb::connect(None)?;
         let s = &c.setup().roots[screen];
         let root = s.root;
@@ -140,7 +140,7 @@ impl X {
             win,
             AtomEnum::WM_CLASS,
             AtomEnum::STRING,
-            b"niruterm\0NIRUTERM\0",
+            &wm_class(class),
         )?;
         // Files can be dropped on the window (XDND version 5).
         c.change_property32(
@@ -768,4 +768,18 @@ pub fn decode_path(s: &str) -> std::path::PathBuf {
         i += 1;
     }
     std::path::PathBuf::from(std::ffi::OsString::from_vec(out))
+}
+
+/// WM_CLASS: the instance and the class. `--class NAME` sets both, as kitty
+/// does, so window rules written for `kitty --class NAME` keep matching.
+pub fn wm_class(class: &str) -> Vec<u8> {
+    if class.is_empty() || class == "niruterm" {
+        return b"niruterm\0NIRUTERM\0".to_vec();
+    }
+    let mut v = Vec::with_capacity(class.len() * 2 + 2);
+    for _ in 0..2 {
+        v.extend_from_slice(class.as_bytes());
+        v.push(0);
+    }
+    v
 }

@@ -36,7 +36,18 @@ struct Cell {
     link: bool,
 }
 
+/// What the command line asks of the window.
+#[derive(Default)]
+pub struct Options {
+    pub title: Option<String>,
+    pub class: Option<String>,
+    /// Keep the window open after the program ends, until a key is pressed.
+    pub hold: bool,
+}
+
 pub struct App {
+    hold: bool,
+    held: bool,
     x: X,
     cv: Canvas,
     fonts: Fonts,
@@ -75,11 +86,16 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(spawn: Spawn, title: Option<String>, started: Instant) -> Res<Self> {
+    pub fn new(spawn: Spawn, opts: Options, started: Instant) -> Res<Self> {
         let settings = palette::settings();
         let pal = palette::load(&settings);
         // The window is opened at kitty's default size (1200 x 760).
-        let x = X::open(1200, 760, title.as_deref().unwrap_or("NIRUTERM"))?;
+        let x = X::open(
+            1200,
+            760,
+            opts.title.as_deref().unwrap_or("NIRUTERM"),
+            opts.class.as_deref().unwrap_or(""),
+        )?;
         let dpi = crate::font::dpi_scale(x.xft_dpi());
         let fonts = Fonts::new(
             settings.font.as_deref(),
@@ -132,6 +148,8 @@ impl App {
             inotify,
             dirty: true,
             quit: false,
+            hold: opts.hold,
+            held: false,
             focused: true,
             cols,
             lines,
@@ -337,6 +355,10 @@ impl App {
                 self.bell_until = Some(Instant::now() + Duration::from_millis(90));
                 self.dirty = true;
             }
+            Note::Exit if self.hold => {
+                self.held = true;
+                self.dirty = true;
+            }
             Note::Exit => self.quit = true,
         }
     }
@@ -386,6 +408,7 @@ impl App {
             }
             Event::SelectionNotify(e) => self.got_selection(e.property, e.selection),
             Event::MappingNotify(e) if e.request != Mapping::POINTER => self.x.reload_keymap(),
+            Event::KeyPress(_) if self.held => self.quit = true,
             Event::KeyPress(e) => self.key(e.detail, e.state),
             Event::ButtonPress(e) => {
                 self.button(e.detail, e.event_x as i32, e.event_y as i32, e.state, true)

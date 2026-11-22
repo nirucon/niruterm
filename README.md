@@ -48,9 +48,13 @@ Measured on the same machine in the same X server (Debian 13).
 ## Using it
 
 ```text
-niruterm [-e PROGRAM ARGS...] [--working-directory DIR] [--title TITLE]
+niruterm [--working-directory DIR] [--title TITLE] [--class NAME] [--hold] [-e] [PROGRAM ARGS...]
 niruterm icat [--width COLS] FILE...
 ```
+
+kitty's options are understood (`--class`, `--hold`, `--directory`, a program
+right after the options; `-o` is ignored), so `kitty` can be replaced by
+`niruterm` in a command and window rules for its class keep working.
 
 | Keys | |
 |---|---|

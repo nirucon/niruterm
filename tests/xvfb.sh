@@ -58,4 +58,21 @@ k "exit"
 sleep 0.8
 if kill -0 "$T" 2>/dev/null; then fail 'the window stayed after exit'; fi
 echo "typing, picture, resize and exit ok"
+# kitty's options: --class names the window, --hold keeps it after the
+# program ends until a key, and the program may follow the options directly.
+"$BIN" --class probe-niru --hold -o remember_window_size=no sh -c 'printf held > '"$SB"'/held' 2>>"$SB/err" &
+H=$!
+PIDS="$PIDS $H"
+sleep 1.2
+HW=$(xdotool search --class probe-niru | head -1)
+[ -n "$HW" ] || fail 'no window with the --class name'
+xprop -id "$HW" WM_CLASS | grep -q '"probe-niru", "probe-niru"' || fail "WM_CLASS: $(xprop -id "$HW" WM_CLASS)"
+[ "$(cat "$SB/held" 2>/dev/null)" = held ] || fail 'the program after the options did not run'
+kill -0 "$H" 2>/dev/null || fail '--hold closed the window when the program ended'
+xdotool windowmove "$HW" 0 0
+xdotool mousemove 100 100
+xdotool key Return
+sleep 0.6
+if kill -0 "$H" 2>/dev/null; then fail 'a key did not close the held window'; fi
+echo "class, hold and kitty-style command ok"
 echo PASS
