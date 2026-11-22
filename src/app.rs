@@ -45,6 +45,9 @@ pub struct Options {
     pub hold: bool,
 }
 
+/// A scaled picture and the picture it was scaled from.
+type ScaledPicture = (Arc<Image>, Arc<Image>);
+
 pub struct App {
     hold: bool,
     held: bool,
@@ -76,7 +79,10 @@ pub struct App {
     bell_until: Option<Instant>,
     blink_on: bool,
     blink_at: Instant,
-    scaled: HashMap<(u32, i32, i32), Arc<Image>>,
+    /// Scaled pictures by (image id, width, height), with the picture they
+    /// were scaled from: a program that sends a new picture under the same id
+    /// (NPLAY's album cover) must not get the old one back.
+    scaled: HashMap<(u32, i32, i32), ScaledPicture>,
     theme_reload: Option<Instant>,
     last_draw: Instant,
     started: Instant,
@@ -1049,11 +1055,14 @@ impl App {
                 };
                 let (bw, bh) = (p.cols as i32 * cw, p.rows as i32 * ch);
                 let key = (p.image, bw, bh);
-                let scaled = self
-                    .scaled
-                    .entry(key)
-                    .or_insert_with(|| Arc::new(crate::image::scale_to_fit(img, bw, bh)))
-                    .clone();
+                let scaled = match self.scaled.get(&key) {
+                    Some((source, scaled)) if Arc::ptr_eq(source, img) => scaled.clone(),
+                    _ => {
+                        let scaled = Arc::new(crate::image::scale_to_fit(img, bw, bh));
+                        self.scaled.insert(key, (img.clone(), scaled.clone()));
+                        scaled
+                    }
+                };
                 self.cv
                     .image(pad + p.col as i32 * cw, pad + row as i32 * ch, &scaled, 255);
             }

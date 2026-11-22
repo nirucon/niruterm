@@ -27,6 +27,27 @@ def chunk(t, d):
 png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
 open(sys.argv[1], "wb").write(png)
 PY
+# The same picture in blue, and a sender that works like NPLAY's album
+# cover: delete image 31, then send the new picture under the same id and
+# the same cell size.
+python3 - "$SB/blue.png" <<'PY'
+import struct, sys, zlib
+w = h = 64
+raw = b"".join(b"\x00" + b"\x00\x00\xff\xff" * w for _ in range(h))
+def chunk(t, d):
+    c = struct.pack(">I", len(d)) + t + d
+    return c + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+open(sys.argv[1], "wb").write(png)
+PY
+cat > "$SB/cover.py" <<'PY'
+import base64, sys
+data = base64.b64encode(open(sys.argv[1], "rb").read()).decode()
+out = "\x1b[H\x1b_Ga=d,d=I,i=31,q=2\x1b\\"
+out += "\x1b_Ga=T,f=100,t=d,i=31,q=2,C=1,c=8,r=4;" + data + "\x1b\\"
+sys.stdout.write(out)
+sys.stdout.flush()
+PY
 NIRUTERM_TIMING=1 "$BIN" -e bash --norc 2>"$SB/err" &
 T=$!
 PIDS="$PIDS $T"
@@ -46,6 +67,12 @@ k "clear; $BIN icat $SB/red.png"
 sleep 0.6
 import -window "$W" -crop 1x1+20+20 txt:- > "$SB/px" 2>/dev/null || import -window root -crop 1x1+20+20 txt:- > "$SB/px"
 grep -qi 'FF0000\|255,0,0' "$SB/px" || fail "no picture at the top left: $(cat "$SB/px")"
+# A new picture under the same id and size replaces the old one (NPLAY
+# showed the previous album cover after a track change).
+k "clear; python3 $SB/cover.py $SB/red.png; sleep 0.3; python3 $SB/cover.py $SB/blue.png"
+sleep 0.8
+import -window "$W" -crop 1x1+20+20 txt:- > "$SB/px2" 2>/dev/null || import -window root -crop 1x1+20+20 txt:- > "$SB/px2"
+grep -qi '0000FF\|0,0,255' "$SB/px2" || fail "the old picture stayed under a reused id: $(cat "$SB/px2")"
 # Resizing reaches the program as a new size.
 k "stty size > $SB/size1"
 xdotool windowsize "$W" 700 400
