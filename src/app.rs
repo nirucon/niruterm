@@ -1,5 +1,6 @@
 //! The NIRUTERM window: drawing the grid, keys, mouse, selection, clipboard,
-//! images, theme and font changes.
+//! images, theme and font changes; the history search, the keyboard hints,
+//! prompt jumps and notifications.
 use crate::canvas::{Canvas, Image, Rect};
 use crate::font::Fonts;
 use crate::palette::{self, Cursor, Palette, Settings};
@@ -48,6 +49,25 @@ pub struct Options {
 /// A scaled picture and the picture it was scaled from.
 type ScaledPicture = (Arc<Image>, Arc<Image>);
 
+/// At most this many matches are kept by the history search.
+const SEARCH_LIMIT: usize = 100_000;
+
+/// The history search bar (Ctrl+Shift+F).
+#[derive(Default)]
+struct Search {
+    query: String,
+    matches: Vec<(Point, Point)>,
+    current: Option<usize>,
+    /// Output arrived since the matches were found.
+    stale: bool,
+}
+
+/// Keyboard hints (Ctrl+Shift+E): a label on every link and path.
+struct Hints {
+    list: Vec<(String, crate::text::Hint)>,
+    typed: String,
+}
+
 pub struct App {
     hold: bool,
     held: bool,
@@ -89,6 +109,12 @@ pub struct App {
     shown: bool,
     mouse_btn: Option<u8>,
     drop_source: Option<Window>,
+    search: Option<Search>,
+    hints: Option<Hints>,
+    /// The urgency flag is set (a bell while the window was not focused).
+    urgent: bool,
+    /// A short message at the top right, until the time.
+    toast: Option<(String, Instant)>,
 }
 
 impl App {
@@ -179,6 +205,10 @@ impl App {
             shown: false,
             mouse_btn: None,
             drop_source: None,
+            search: None,
+            hints: None,
+            urgent: false,
+            toast: None,
         })
     }
 
@@ -246,6 +276,10 @@ impl App {
                 self.bell_until = None;
                 self.dirty = true;
             }
+            if self.toast.as_ref().is_some_and(|t| Instant::now() >= t.1) {
+                self.toast = None;
+                self.dirty = true;
+            }
             if self.settings.cursor_blink
                 && self.focused
                 && self.blink_at.elapsed() >= Duration::from_millis(530)
@@ -290,6 +324,9 @@ impl App {
             if let Some(t) = self.bell_until {
                 at(t.saturating_duration_since(Instant::now()));
             }
+            if let Some((_, t)) = &self.toast {
+                at(t.saturating_duration_since(Instant::now()));
+            }
             if self.settings.cursor_blink && self.focused {
                 at(Duration::from_millis(530).saturating_sub(self.blink_at.elapsed()));
             }
@@ -316,6 +353,9 @@ impl App {
                 let mut v = 0u64;
                 unsafe { libc::read(self.wake, &mut v as *mut u64 as *mut libc::c_void, 8) };
                 self.dirty = true;
+                if let Some(s) = self.search.as_mut() {
+                    s.stale = true;
+                }
             }
             if n == 3 && fds[2].revents & libc::POLLIN != 0 {
                 let mut buf = [0u8; 4096];
@@ -360,6 +400,25 @@ impl App {
             Note::Bell => {
                 self.bell_until = Some(Instant::now() + Duration::from_millis(90));
                 self.dirty = true;
+                if !self.focused && !self.urgent {
+                    self.urgent = self.x.set_urgent(true).is_ok();
+                }
+            }
+            Note::Finished(f) => {
+                let after = self.settings.notify_after;
+                if after > 0 && !self.focused && f.took >= Duration::from_secs(after) {
+                    let summary = match f.status {
+                        Some(0) | None => "Command finished".to_string(),
+                        Some(n) => format!("Command failed (exit {n})"),
+                    };
+                    let took = crate::open::took(f.took);
+                    let body = if f.command.is_empty() {
+                        format!("took {took}")
+                    } else {
+                        format!("{}\ntook {took}", f.command)
+                    };
+                    crate::open::notify(&summary, &body);
+                }
             }
             Note::Exit if self.hold => {
                 self.held = true;
@@ -392,6 +451,10 @@ impl App {
             }
             Event::FocusIn(_) => {
                 self.focused = true;
+                if self.urgent {
+                    self.urgent = false;
+                    let _ = self.x.set_urgent(false);
+                }
                 if self.mode().contains(TermMode::FOCUS_IN_OUT) {
                     self.session.write(b"\x1b[I");
                 }
@@ -470,6 +533,10 @@ impl App {
     }
 
     fn paste(&mut self, text: &str) {
+        if let Some(s) = self.search.as_mut() {
+            s.query.push_str(text.lines().next().unwrap_or(""));
+            return self.search_update();
+        }
         let mode = self.mode();
         let clean = text
             .replace("\x1b[201~", "")
@@ -544,13 +611,29 @@ impl App {
         if (0xffe1..=0xffee).contains(&sym) || sym == 0xfe03 || sym == 0xff7e {
             return; // modifier keys alone
         }
+        if self.hints.is_some() {
+            return self.hint_key(sym);
+        }
+        if self.search.is_some() && self.search_key(sym, ctrl, shift) {
+            return;
+        }
         // Terminal shortcuts (as kitty).
         if ctrl && shift {
             match sym | 0x20 {
                 0x63 => return self.copy_selection(true),               // C
                 0x76 => return self.paste_from(self.x.atoms.clipboard), // V
                 0x6e => return self.new_window(),                       // N
+                0x66 => return self.open_search(),                      // F
+                0x65 => return self.open_hints(),                       // E
+                0x67 => return self.copy_last_output(),                 // G
                 _ => {}
+            }
+            if !self.mode().contains(TermMode::ALT_SCREEN) {
+                match sym {
+                    0xff52 => return self.jump_prompt(true),  // Up
+                    0xff54 => return self.jump_prompt(false), // Down
+                    _ => {}
+                }
             }
             match sym {
                 0x2b | 0x3d | 0xffab => return self.set_points(self.points + 1.0), // +
@@ -653,6 +736,260 @@ impl App {
         }
     }
 
+    /// A short message at the top right for a moment.
+    fn say(&mut self, text: &str) {
+        self.toast = Some((
+            text.to_string(),
+            Instant::now() + Duration::from_millis(1800),
+        ));
+        self.dirty = true;
+    }
+
+    // -------------------------------------------------------------- search
+
+    fn open_search(&mut self) {
+        self.search = Some(Search::default());
+        self.dirty = true;
+    }
+
+    /// Keys while the search bar is open; false lets a key through.
+    fn search_key(&mut self, sym: u32, ctrl: bool, shift: bool) -> bool {
+        match sym {
+            0xff1b => {
+                self.search = None;
+                self.dirty = true;
+            }
+            0xff0d | 0xff8d => self.search_step(!shift),
+            0xff52 => self.search_step(true),
+            0xff54 => self.search_step(false),
+            0xff08 => {
+                if let Some(s) = self.search.as_mut() {
+                    s.query.pop();
+                }
+                self.search_update();
+            }
+            _ if ctrl && shift && matches!(sym | 0x20, 0x63 | 0x76) => return false,
+            _ if ctrl && shift && sym | 0x20 == 0x66 => {
+                self.search = None;
+                self.dirty = true;
+            }
+            _ if ctrl && sym | 0x20 == 0x75 => {
+                // Ctrl+U empties the search, as in a shell.
+                if let Some(s) = self.search.as_mut() {
+                    s.query.clear();
+                }
+                self.search_update();
+            }
+            _ if ctrl => {}
+            _ => {
+                let c = keysym_char(sym).or_else(|| dead_alone(sym));
+                if let (Some(c), Some(s)) = (c, self.search.as_mut()) {
+                    s.query.push(c);
+                    self.search_update();
+                }
+            }
+        }
+        true
+    }
+
+    /// Finds the query again in the whole history and picks the match
+    /// nearest the bottom of the view.
+    fn search_update(&mut self) {
+        self.dirty = true;
+        let Some(s) = self.search.as_mut() else {
+            return;
+        };
+        let t = self.session.term.lock();
+        let top = -(t.grid().history_size() as i32);
+        let bottom = t.grid().screen_lines() as i32 - 1;
+        s.matches = crate::text::find(&t, &s.query, top, bottom, SEARCH_LIMIT);
+        s.stale = false;
+        let view_bottom = bottom - t.grid().display_offset() as i32;
+        drop(t);
+        s.current = s
+            .matches
+            .iter()
+            .rposition(|m| m.0.line.0 <= view_bottom)
+            .or((!s.matches.is_empty()).then_some(0));
+        if let Some(p) = s.current.map(|i| s.matches[i].0) {
+            self.reveal(p.line.0);
+        }
+    }
+
+    /// Enter goes to the match above (older), Shift+Enter to the one below.
+    fn search_step(&mut self, older: bool) {
+        if self.search.as_ref().is_some_and(|s| s.stale) {
+            self.search_update();
+        }
+        let Some(s) = self.search.as_mut() else {
+            return;
+        };
+        let n = s.matches.len();
+        if n == 0 {
+            return;
+        }
+        let i = match (s.current, older) {
+            (Some(i), true) => (i + n - 1) % n,
+            (Some(i), false) => (i + 1) % n,
+            (None, _) => n - 1,
+        };
+        s.current = Some(i);
+        let line = s.matches[i].0.line.0;
+        self.reveal(line);
+        self.dirty = true;
+    }
+
+    /// Scrolls the history so that a grid line is in view, in the middle
+    /// when it was out of sight.
+    fn reveal(&mut self, line: i32) {
+        let mut t = self.session.term.lock();
+        let offset = t.grid().display_offset() as i32;
+        let lines = self.lines as i32;
+        let (top, bottom) = (-offset, -offset + lines - 2);
+        if line >= top && line <= bottom {
+            return;
+        }
+        let want = (lines / 2 - line).clamp(0, t.grid().history_size() as i32);
+        t.scroll_display(Scroll::Delta(want - offset));
+        self.dirty = true;
+    }
+
+    // --------------------------------------------------------------- hints
+
+    fn open_hints(&mut self) {
+        let cwd = self.session.cwd().unwrap_or_else(|| "/".into());
+        let home = palette::home();
+        let t = self.session.term.lock();
+        let first = -(t.grid().display_offset() as i32);
+        let last = first + self.lines as i32 - 1;
+        let found = crate::text::hints(&t, first, last, |p| crate::text::resolve(p, &cwd, &home));
+        drop(t);
+        if found.is_empty() {
+            return self.say("No links or paths on the screen");
+        }
+        // The labels start at the bottom, where the newest output is.
+        let labels = crate::text::labels(found.len());
+        let n = labels.len();
+        let list = found
+            .into_iter()
+            .rev()
+            .take(n)
+            .zip(labels)
+            .map(|(h, l)| (l, h))
+            .collect();
+        self.hints = Some(Hints {
+            list,
+            typed: String::new(),
+        });
+        self.dirty = true;
+    }
+
+    /// Keys while the hints are shown: a label opens its link or path, the
+    /// label in capitals types it instead, Esc goes back.
+    fn hint_key(&mut self, sym: u32) {
+        self.dirty = true;
+        let Some(h) = self.hints.as_mut() else {
+            return;
+        };
+        match sym {
+            0xff1b => {
+                self.hints = None;
+                return;
+            }
+            0xff08 => {
+                h.typed.pop();
+                return;
+            }
+            _ => {}
+        }
+        let Some(c) = keysym_char(sym).filter(|c| c.is_ascii_alphabetic()) else {
+            return;
+        };
+        h.typed.push(c.to_ascii_lowercase());
+        if !h.list.iter().any(|(l, _)| l.starts_with(&h.typed)) {
+            h.typed.pop();
+            return;
+        }
+        let Some(i) = h.list.iter().position(|(l, _)| *l == h.typed) else {
+            return;
+        };
+        let hint = h.list.swap_remove(i).1;
+        self.hints = None;
+        if c.is_ascii_uppercase() {
+            return self.paste(&hint.text);
+        }
+        match hint.target {
+            crate::text::Target::Url(u) => crate::open::xdg_open(&u),
+            crate::text::Target::Path(p, line) => {
+                if std::path::Path::new(&p).is_dir() {
+                    crate::open::xdg_open(&p)
+                } else {
+                    crate::open::file(&p, line, self.settings.editor.as_deref())
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------ shell marks
+
+    /// Scrolls the history to the prompt above or below the top of the view.
+    fn jump_prompt(&mut self, up: bool) {
+        let mut t = self.session.term.lock();
+        let offset = t.grid().display_offset() as i32;
+        let top = -offset;
+        let (target, any) = match self.session.marks.lock() {
+            Ok(m) => {
+                let p = m.prompts();
+                let target = if up {
+                    p.filter(|&l| l < top).max()
+                } else {
+                    p.filter(|&l| l > top).min()
+                };
+                (target, !m.is_empty())
+            }
+            Err(_) => (None, false),
+        };
+        let want = match target {
+            Some(l) => (-l).clamp(0, t.grid().history_size() as i32),
+            None if up => {
+                drop(t);
+                return self.say(if any {
+                    "No earlier prompt"
+                } else {
+                    "No prompt marks: niruprompt install bash|fish"
+                });
+            }
+            None => 0,
+        };
+        t.scroll_display(Scroll::Delta(want - offset));
+        self.dirty = true;
+    }
+
+    /// Ctrl+Shift+G: the output of the last command to the clipboard.
+    fn copy_last_output(&mut self) {
+        let t = self.session.term.lock();
+        let out = self
+            .session
+            .marks
+            .lock()
+            .ok()
+            .and_then(|m| m.last_output(&t));
+        drop(t);
+        match out {
+            Some(text) if !text.is_empty() => {
+                let n = text.lines().count();
+                self.clip_text = text;
+                let _ = self.x.own_clipboard();
+                self.say(&format!(
+                    "Copied the output ({n} line{})",
+                    if n == 1 { "" } else { "s" }
+                ));
+            }
+            Some(_) => self.say("The last command printed nothing"),
+            None => self.say("No command output yet"),
+        }
+    }
+
     fn new_window(&mut self) {
         let mut c = std::process::Command::new(
             std::env::current_exe().unwrap_or_else(|_| "niruterm".into()),
@@ -747,6 +1084,9 @@ impl App {
     }
 
     fn button(&mut self, b: u8, x: i32, y: i32, state: KeyButMask, press: bool) {
+        if press && self.hints.take().is_some() {
+            self.dirty = true;
+        }
         if self.report_mouse(b, x, y, state, press, false) {
             if press {
                 self.mouse_btn = Some(b);
@@ -786,7 +1126,7 @@ impl App {
                 let ctrl = state.contains(KeyButMask::CONTROL);
                 if ctrl {
                     if let Some(url) = self.url_at(x, y) {
-                        spawn_open(&url);
+                        crate::open::xdg_open(&url);
                         return;
                     }
                 }
@@ -932,6 +1272,33 @@ impl App {
         let sel = content.selection;
         let cursor = content.cursor;
         let mode = content.mode;
+        // Search matches in view: 1 a match, 2 the current one.
+        let (cols, lines) = (self.cols, self.lines);
+        let mut found: Vec<u8> = Vec::new();
+        if let Some(s) = self.search.as_ref().filter(|s| !s.query.is_empty()) {
+            found = vec![0; cols * lines];
+            let current = s.current.and_then(|i| s.matches.get(i)).map(|m| m.0);
+            let first = -offset;
+            let seen = crate::text::find(&t, &s.query, first, first + lines as i32 - 1, 10_000);
+            for (a, b) in seen {
+                let v = if Some(a) == current { 2 } else { 1 };
+                for line in a.line.0..=b.line.0 {
+                    let row = line + offset;
+                    if row < 0 || row >= lines as i32 {
+                        continue;
+                    }
+                    let c0 = if line == a.line.0 { a.column.0 } else { 0 };
+                    let c1 = if line == b.line.0 {
+                        b.column.0
+                    } else {
+                        cols - 1
+                    };
+                    for c in c0..=c1.min(cols - 1) {
+                        found[row as usize * cols + c] = v;
+                    }
+                }
+            }
+        }
         let mut cells: Vec<Cell> = Vec::with_capacity(self.cols * self.lines);
         for item in content.display_iter {
             let cell = item.cell;
@@ -956,6 +1323,13 @@ impl App {
                 bg = pal.sel_bg;
                 if let Some(f) = pal.sel_fg {
                     fg = f;
+                }
+            }
+            if !found.is_empty() && row >= 0 && (row as usize) < lines && (col as usize) < cols {
+                match found[row as usize * cols + col as usize] {
+                    1 => (fg, bg) = (pal.bg, pal.ansi[3]),
+                    2 => (fg, bg) = (pal.bg, pal.fg),
+                    _ => {}
                 }
             }
             if flags.contains(Flags::HIDDEN) {
@@ -1105,9 +1479,76 @@ impl App {
                 }
             }
         }
-        // History position, top right, while scrolled back.
-        if offset > 0 {
-            let label = format!("{offset}/{history}");
+        // Keyboard hints: the link underlined, its label over its start.
+        if let Some(h) = &self.hints {
+            for (label, hint) in &h.list {
+                if !label.starts_with(&h.typed) {
+                    continue;
+                }
+                let (a, b) = (hint.start, hint.end);
+                let thick = (ch / 14).max(2);
+                for line in a.line.0..=b.line.0 {
+                    let row = line + offset;
+                    if row < 0 || row >= lines as i32 {
+                        continue;
+                    }
+                    let c0 = if line == a.line.0 { a.column.0 } else { 0 };
+                    let c1 = if line == b.line.0 {
+                        b.column.0
+                    } else {
+                        cols - 1
+                    };
+                    let r = Rect::new(
+                        pad + c0 as i32 * cw,
+                        pad + row * ch + ch - thick,
+                        (c1 + 1 - c0) as i32 * cw,
+                        thick,
+                    );
+                    self.cv.fill(r, pal.ansi[3]);
+                }
+                let row = a.line.0 + offset;
+                if (0..lines as i32).contains(&row) {
+                    let (x, y) = (pad + a.column.0 as i32 * cw, pad + row * ch);
+                    let n = label.chars().count() as i32;
+                    self.cv.fill(Rect::new(x, y, n * cw, ch), pal.ansi[3]);
+                    for (k, c) in label.chars().enumerate() {
+                        self.fonts
+                            .draw(&mut self.cv, x + k as i32 * cw, y, c, 1, pal.bg, 1);
+                    }
+                }
+            }
+        }
+        // The search bar over the last line.
+        if let Some(s) = &self.search {
+            let y = pad + (lines as i32 - 1) * ch;
+            self.cv.fill(Rect::new(0, y, w, ch + pad), pal.sel_bg);
+            let count = match (s.current, s.matches.len()) {
+                _ if s.query.is_empty() => String::new(),
+                (_, 0) => "no matches".to_string(),
+                (Some(i), n) => format!("{}/{n}", i + 1),
+                (None, n) => format!("{n}"),
+            };
+            let text = format!("Find: {}", s.query);
+            let n = text.chars().count() as i32;
+            for (k, c) in text.chars().enumerate() {
+                self.fonts
+                    .draw(&mut self.cv, pad + k as i32 * cw, y, c, 0, pal.fg, 1);
+            }
+            self.cv
+                .fill(Rect::new(pad + n * cw, y, (cw / 8).max(2), ch), pal.cursor);
+            let cn = count.chars().count() as i32;
+            for (k, c) in count.chars().enumerate() {
+                let x = w - pad - (cn - k as i32) * cw;
+                self.fonts.draw(&mut self.cv, x, y, c, 0, pal.fg, 1);
+            }
+        }
+        // A message, or the history position while scrolled back, top right.
+        let label = match &self.toast {
+            Some((t, _)) => Some(t.clone()),
+            None if offset > 0 => Some(format!("{offset}/{history}")),
+            None => None,
+        };
+        if let Some(label) = label {
             let lw = label.chars().count() as i32 * cw;
             let r = Rect::new(w - pad - lw - cw, pad / 2, lw + cw, ch);
             self.cv.fill(r, pal.sel_bg);
@@ -1360,26 +1801,6 @@ fn shell_quote(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
-    }
-}
-
-fn spawn_open(url: &str) {
-    use std::os::unix::process::CommandExt;
-    let mut c = std::process::Command::new("xdg-open");
-    c.arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    unsafe {
-        c.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    if let Ok(mut child) = c.spawn() {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
     }
 }
 

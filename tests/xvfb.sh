@@ -1,16 +1,24 @@
 #!/bin/sh
 # End-to-end checks in a private Xvfb: first frame, typing through the PTY,
-# a picture through the kitty graphics protocol (icat), resizing and exit.
-# Usage: tests/xvfb.sh PATH/TO/niruterm
+# a picture through the kitty graphics protocol (icat), resizing and exit;
+# shell integration with NIRUPROMPT (prompt jumps, the last output), the
+# history search, keyboard hints, notifications and the urgency flag.
+# Everything runs with HOME and the XDG folders in a temporary folder.
+# Usage: tests/xvfb.sh PATH/TO/niruterm (niruprompt next to it)
 set -eu
 BIN=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 SB=$(mktemp -d)
 PIDS=""
 cleanup() { for p in $PIDS; do kill "$p" 2>/dev/null || true; done; rm -rf "$SB"; }
 trap cleanup EXIT INT TERM
-export HOME=$SB/home XDG_CONFIG_HOME=$SB/config
-mkdir -p "$HOME" "$XDG_CONFIG_HOME"
-D=:$((40 + $$ % 20))
+export HOME=$SB/home XDG_CONFIG_HOME=$SB/config XDG_CACHE_HOME=$SB/cache \
+    XDG_STATE_HOME=$SB/state XDG_RUNTIME_DIR=$SB/run
+mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+# A free display: other tests may run their own Xvfb at the same time.
+n=$((40 + $$ % 20))
+while [ -e "/tmp/.X$n-lock" ] || [ -e "/tmp/.X11-unix/X$n" ]; do n=$((n + 1)); done
+D=:$n
 Xvfb "$D" -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 &
 PIDS="$PIDS $!"
 export DISPLAY=$D
@@ -114,4 +122,134 @@ k 'printf %s "$SHELL" > '"$SB"'/shellvar'
 case "$(cat "$SB/shellvar" 2>/dev/null)" in */sh) ;; *) fail "SHELL inside is '$(cat "$SB/shellvar" 2>/dev/null)'" ;; esac
 k exit
 echo "chosen shell is SHELL ok"
+# ---------------------------------------------------------------- 0.2.0
+# Shell integration: bash with NIRUPROMPT sends the OSC 133 marks. Programs
+# NIRUTERM starts (notify-send, xdg-open, the editor) are stand-ins that
+# write down how they were called.
+NP=$(dirname "$BIN")/niruprompt
+[ -x "$NP" ] || fail "no niruprompt next to $BIN"
+mkdir -p "$SB/bin"
+for p in notify-send:notified xdg-open:opened fake-editor:edited; do
+    printf '#!/bin/sh\nprintf "%%s\\n" "$@" >> %s/%s\n' "$SB" "${p#*:}" > "$SB/bin/${p%%:*}"
+done
+chmod +x "$SB"/bin/*
+printf 'notify_after = 1\neditor = "fake-editor"\n' > "$XDG_CONFIG_HOME/niruterm/config.toml"
+"$NP" init bash > "$SB/niru.bash"
+printf 'one\ntwo\nthree\n' > "$SB/target.txt"
+# A solid run of a colour (24x2 pixels, wider than any glyph stroke) in a
+# screenshot of the root window (1280x800).
+cat > "$SB/block.py" <<'PY'
+import sys
+data, colour, w, h = open(sys.argv[1], "rb").read(), bytes.fromhex(sys.argv[2]), 24, 2
+row, pat = 1280 * 3, colour * w
+for y in range(800 - h):
+    line = data[y * row:(y + 1) * row]
+    i = line.find(pat)
+    while i != -1:
+        if i % 3 == 0 and all(data[(y + k) * row + i:(y + k) * row + i + len(pat)] == pat for k in range(1, h)):
+            sys.exit(0)
+        i = line.find(pat, i + 1)
+sys.exit(1)
+PY
+block() { import -window root -depth 8 "rgb:$SB/shot.rgb" && python3 "$SB/block.py" "$SB/shot.rgb" "$1"; }
+clip() { timeout 3 xclip -o -selection clipboard 2>/dev/null || true; }
+PATH="$SB/bin:$PATH" NIRUPROMPT_STYLE=ascii "$BIN" --class probe-int --working-directory "$HOME" \
+    -e bash --rcfile "$SB/niru.bash" -i 2>>"$SB/err" &
+I=$!
+PIDS="$PIDS $I"
+"$BIN" --class probe-other -e sleep 60 2>>"$SB/err" &
+PIDS="$PIDS $!"
+sleep 2
+IW=$(xdotool search --sync --onlyvisible --class probe-int | head -1)
+OW=$(xdotool search --sync --onlyvisible --class probe-other | head -1)
+xdotool windowmove "$OW" 600 400
+xdotool windowmove "$IW" 0 0
+xdotool windowfocus --sync "$IW"
+# Ctrl+Shift+G copies the output of the last command.
+k "seq 1 5"
+xdotool key ctrl+shift+g
+sleep 0.3
+[ "$(clip)" = "$(seq 1 5)" ] || fail "the last output was not copied: '$(clip)'"
+# Ctrl+Shift+Up shows the prompt above the view at the top: a triple-click
+# on the first row copies the prompt line with its command.
+k "seq 1 300"
+xdotool key ctrl+shift+Up
+sleep 0.4
+xdotool mousemove 40 16 click --repeat 3 --delay 60 1
+sleep 0.3
+case "$(clip)" in *'$ seq 1 300'*) ;; *) fail "Ctrl+Shift+Up did not reach the prompt: '$(clip)'" ;; esac
+xdotool key ctrl+shift+Down
+echo "shell integration (last output, prompt jumps) ok"
+# Ctrl+Shift+F finds text in the history and shows the matches: the current
+# one in the foreground colour, the others in yellow (colour 3); Esc closes.
+k "clear; for i in 1 2 3; do echo needle-\$i; done; seq 1 300"
+if block e5e5e5 || block b5a47e; then fail 'highlight colours before the search'; fi
+xdotool key ctrl+shift+f
+xdotool type --delay 15 needle
+sleep 0.5
+block e5e5e5 || fail 'no current match in view'
+block b5a47e || fail 'no other matches in view'
+xdotool key Return Return
+sleep 0.3
+block e5e5e5 || fail 'Enter lost the current match'
+xdotool key Escape
+sleep 0.4
+if block b5a47e; then fail 'matches stayed after Esc'; fi
+echo "history search ok"
+# Ctrl+Shift+E labels links and paths from the bottom up: a opens the path
+# at its line in the editor (in a new window), s the link with xdg-open,
+# capital S types the link, Esc goes back to the shell.
+k "f=$SB/target.txt"
+k "clear; echo visit https://example.com/x; echo at \$f:3 here"
+xdotool key ctrl+shift+e
+sleep 0.3
+xdotool key a
+sleep 2
+[ "$(cat "$SB/edited" 2>/dev/null)" = "$(printf '+3\n%s' "$SB/target.txt")" ] || fail "editor: '$(cat "$SB/edited" 2>/dev/null)'"
+xdotool windowfocus --sync "$IW"
+xdotool key ctrl+shift+e
+sleep 0.3
+xdotool key s
+sleep 0.8
+[ "$(cat "$SB/opened" 2>/dev/null)" = https://example.com/x ] || fail "xdg-open: '$(cat "$SB/opened" 2>/dev/null)'"
+xdotool type --delay 15 'printf %s '
+xdotool key ctrl+shift+e
+sleep 0.3
+xdotool key S
+xdotool type --delay 15 " > $SB/typed-link"
+xdotool key Return
+sleep 0.6
+[ "$(cat "$SB/typed-link" 2>/dev/null)" = https://example.com/x ] || fail "capital label: '$(cat "$SB/typed-link" 2>/dev/null)'"
+xdotool key ctrl+shift+e
+sleep 0.3
+xdotool key Escape
+k "printf back > $SB/after-hints"
+[ "$(cat "$SB/after-hints" 2>/dev/null)" = back ] || fail 'keys did not reach the shell after Esc'
+echo "keyboard hints ok"
+# A command longer than notify_after (1 s) that ends while the window is
+# not focused is notified; a bell then sets the urgency flag until focus.
+k "sleep 1.3"
+sleep 1.2
+[ ! -s "$SB/notified" ] || fail "notified while focused: $(cat "$SB/notified")"
+xdotool type --delay 15 "sleep 1.3; printf '\\a'"
+xdotool key Return
+xdotool windowfocus --sync "$OW"
+sleep 2.3
+grep -q '^Command finished$' "$SB/notified" || fail "no notification: $(cat "$SB/notified" 2>/dev/null)"
+grep -q "sleep 1.3; printf" "$SB/notified" || fail "the command is not in the notification: $(cat "$SB/notified")"
+xprop -id "$IW" WM_HINTS | grep -qi urgen || fail "no urgency after a bell: $(xprop -id "$IW" WM_HINTS)"
+xdotool windowfocus --sync "$IW"
+sleep 0.4
+if xprop -id "$IW" WM_HINTS | grep -qi urgen; then fail 'the urgency stayed after focus'; fi
+: > "$SB/notified"
+xdotool type --delay 15 "sleep 1.3; false"
+xdotool key Return
+xdotool windowfocus --sync "$OW"
+sleep 2.3
+grep -q '^Command failed (exit 1)$' "$SB/notified" || fail "no failure notification: $(cat "$SB/notified" 2>/dev/null)"
+xdotool windowfocus --sync "$IW"
+k exit
+sleep 0.6
+if kill -0 "$I" 2>/dev/null; then fail 'the window stayed after exit'; fi
+echo "notifications and urgency ok"
 echo PASS

@@ -41,6 +41,22 @@ Measured on the same machine in the same X server (Debian 13).
 - **Clipboard** shared with every program (CLIPBOARD and the selection), safe
   bracketed paste, OSC 52 from programs over SSH.
 - **Links:** Ctrl+click opens a URL or an OSC 8 link.
+- **Keyboard hints:** Ctrl+Shift+E puts a letter on every link and file
+  path on the screen; typing it opens a link with `xdg-open` and a
+  `path:line` (compiler errors, grep output) in your editor at that line.
+  The label in capitals types the link or path at the prompt instead.
+- **Search the history:** Ctrl+Shift+F opens a search bar; every match in
+  the history and on the screen is highlighted. Lower case finds either
+  case, a capital letter makes the search exact.
+- **Shell integration** through the prompt marks of OSC 133 (as kitty, foot
+  and WezTerm): jump between prompts with Ctrl+Shift+Up and Down, copy the
+  output of the last command with Ctrl+Shift+G. NIRUPROMPT sends the marks
+  for bash and fish.
+- **Notifications:** a command that ran for 10 seconds or more and ends
+  while the window is not focused sends a desktop notification (to
+  NIRUNOTIFY or any notification service), with its exit status.
+- **Bell:** when the window is not focused, a bell marks it urgent, so
+  NIRUWM and NIRUBAR show its workspace; focusing it clears the mark.
 - **Drop files** on the window to type their paths, quoted for the shell.
 - **History** of 10,000 lines (configurable), with its position shown while
   scrolled back.
@@ -64,6 +80,13 @@ right after the options; `-o` is ignored), so `kitty` can be replaced by
 | Ctrl+Shift+Plus, Minus, 0 | font size |
 | Shift+PgUp, PgDn, Home, End | history |
 | Ctrl+click | open a link |
+| Ctrl+Shift+F | search the history: Enter (or Up) the match above, Shift+Enter (or Down) the one below, Esc closes |
+| Ctrl+Shift+E | hints: type a label to open it, the label in capitals to type it, Esc cancels |
+| Ctrl+Shift+Up, Down | the previous or next prompt |
+| Ctrl+Shift+G | copy the output of the last command |
+
+The prompt keys need a shell that sends the OSC 133 marks: bash or fish with
+`niruprompt install`, or fish 4, which sends them itself.
 
 ## Configuration
 
@@ -79,11 +102,18 @@ scrollback = 10000
 cursor = "beam"                     # beam, block or underline
 cursor_blink = false
 copy_on_select = true
+notify_after = 10                   # seconds; 0 turns notifications off
+editor = "nvim"                     # for path:line hints; else $VISUAL, $EDITOR
 
 [colors]                            # on top of the NIRUX theme
 background = "#101010"
 color4 = "#88aacc"
 ```
+
+A text file from a hint opens in the editor in a new NIRUTERM window, or in
+its own window for editors that have one (VS Code, gedit, Kate and others);
+folders and other files open with `xdg-open`. Notifications are sent with
+`notify-send`, or `gdbus` when it is missing.
 
 ## NIRUPROMPT: prompt, aliases and history
 
@@ -96,6 +126,10 @@ niruprompt styles                   preview every style
 niruprompt alias list|add NAME COMMAND|rm NAME
 ```
 
+- **Shell integration:** the prompt carries the OSC 133 marks (where the
+  prompt, the command and its output start, and the exit status), which
+  NIRUTERM, kitty, foot and WezTerm understand. They are left out on the
+  Linux console.
 - **Prompt styles** in the theme's own colours: the folder, the git branch
   (and `*` for changes, with a 150 ms limit so big repositories never slow it
   down), the time of the last long command, background jobs, the Python

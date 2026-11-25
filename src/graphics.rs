@@ -2,22 +2,33 @@
 //! the protocol `icat`, yazi, ranger, timg and chafa use. The PTY stream is
 //! scanned for these sequences before the terminal parser sees it; images are
 //! decoded on the reader thread and placed at the cursor, anchored to their
-//! grid line so they scroll with the text.
+//! grid line so they scroll with the text. The same scanner takes out the
+//! shell's semantic prompt marks (OSC 133, see marks.rs); every other escape
+//! sequence goes to the terminal parser unchanged.
 use crate::canvas::Image;
 use std::collections::HashMap;
 
-/// Splits a byte stream into terminal text and graphics commands, keeping
-/// state across reads (a sequence may arrive in several pieces).
+/// Splits a byte stream into terminal text, graphics commands and prompt
+/// marks, keeping state across reads (a sequence may arrive in several
+/// pieces).
 #[derive(Default)]
 pub struct Scanner {
-    state: u8, // 0 text, 1 saw ESC, 2 in APC, 3 in APC saw ESC
+    // 0 text, 1 saw ESC, 2 in APC, 3 in APC saw ESC, 4 in an OSC that may be
+    // 133, 5 in OSC 133, 6 in OSC 133 saw ESC.
+    state: u8,
     apc: Vec<u8>,
+    osc: Vec<u8>,
 }
+
+/// The start of a semantic prompt mark: `ESC ] 133 ;`.
+const MARK: &[u8] = b"133;";
 
 pub enum Piece<'a> {
     Text(&'a [u8]),
     Owned(Vec<u8>),
     Command(Vec<u8>),
+    /// An OSC 133 mark: what follows `133;` (`A`, `B`, `C`, `D;0`).
+    Mark(Vec<u8>),
 }
 
 impl Scanner {
@@ -42,6 +53,10 @@ impl Scanner {
                         self.state = 2;
                         self.apc.clear();
                         start = i + 1;
+                    } else if b == b']' {
+                        self.state = 4;
+                        self.osc.clear();
+                        start = i + 1;
                     } else {
                         // Not an APC: give the ESC back to the parser.
                         out(Piece::Owned(vec![0x1b]));
@@ -60,7 +75,7 @@ impl Scanner {
                         self.apc.push(b);
                     }
                 }
-                _ => {
+                3 => {
                     if b == b'\\' {
                         self.finish(&mut out);
                         start = i + 1;
@@ -70,12 +85,55 @@ impl Scanner {
                         self.state = 2;
                     }
                 }
+                4 => {
+                    self.osc.push(b);
+                    if !MARK.starts_with(&self.osc) {
+                        // Another OSC (title, colours, links): the parser's.
+                        let mut v = Vec::with_capacity(self.osc.len() + 1);
+                        v.extend_from_slice(b"\x1b]");
+                        v.extend_from_slice(&self.osc[..self.osc.len() - 1]);
+                        out(Piece::Owned(v));
+                        self.state = 0;
+                        start = i;
+                        continue;
+                    }
+                    if self.osc.len() == MARK.len() {
+                        self.osc.clear();
+                        self.state = 5;
+                    }
+                }
+                5 => {
+                    if b == 0x07 {
+                        self.finish_mark(&mut out);
+                        start = i + 1;
+                    } else if b == 0x1b {
+                        self.state = 6;
+                    } else if self.osc.len() < 4096 {
+                        self.osc.push(b);
+                    }
+                }
+                _ => {
+                    self.finish_mark(&mut out);
+                    if b == b'\\' {
+                        start = i + 1;
+                    } else {
+                        // An ESC that starts the next sequence.
+                        self.state = 1;
+                        start = i;
+                        continue;
+                    }
+                }
             }
             i += 1;
         }
         if self.state == 0 && start < bytes.len() {
             out(Piece::Text(&bytes[start..]));
         }
+    }
+
+    fn finish_mark(&mut self, out: &mut impl FnMut(Piece)) {
+        self.state = 0;
+        out(Piece::Mark(std::mem::take(&mut self.osc)));
     }
 
     fn finish(&mut self, out: &mut impl FnMut(Piece)) {
@@ -425,6 +483,7 @@ mod tests {
                 Piece::Text(t) => text.extend_from_slice(t),
                 Piece::Owned(t) => text.extend_from_slice(&t),
                 Piece::Command(c) => cmds.push(c),
+                Piece::Mark(_) => panic!("no mark here"),
             });
         }
         assert_eq!(text, b"abcd\x1b[1m");
@@ -432,6 +491,30 @@ mod tests {
         let c = Command::parse(&cmds[0]);
         assert_eq!(c.num('s'), 1);
         assert_eq!(base64(&c.payload), vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn prompt_marks_are_taken_out_and_other_oscs_kept() {
+        let mut sc = Scanner::default();
+        let mut text = Vec::new();
+        let mut marks = Vec::new();
+        for chunk in [
+            &b"a\x1b]133;A\x07b\x1b]0;title\x07c\x1b]1"[..],
+            b"33;D;1",
+            b"\x1b\\d\x1b]13x\x1b]133;C\x1b[0m\x1b]8;;http://x\x07e",
+        ] {
+            sc.feed(chunk, |p| match p {
+                Piece::Text(t) => text.extend_from_slice(t),
+                Piece::Owned(t) => text.extend_from_slice(&t),
+                Piece::Command(_) => panic!("no graphics here"),
+                Piece::Mark(m) => marks.push(m),
+            });
+        }
+        assert_eq!(
+            text,
+            b"ab\x1b]0;title\x07cd\x1b]13x\x1b[0m\x1b]8;;http://x\x07e"
+        );
+        assert_eq!(marks, vec![b"A".to_vec(), b"D;1".to_vec(), b"C".to_vec()]);
     }
 
     #[test]

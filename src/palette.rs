@@ -46,6 +46,11 @@ pub struct Settings {
     pub copy_on_select: bool,
     pub cursor_blink: bool,
     pub cursor: Cursor,
+    /// Seconds a command must run for a notification when it finishes
+    /// while the window is not focused; 0 is never.
+    pub notify_after: u64,
+    /// The editor for `path:line` hints (else $VISUAL or $EDITOR).
+    pub editor: Option<String>,
     pub overrides: Vec<(String, u32)>,
 }
 
@@ -179,21 +184,33 @@ fn kitty_shell_choice(value: &str, installed: impl Fn(&str) -> bool) -> Option<S
 }
 
 pub fn settings() -> Settings {
-    let mut s = Settings {
+    let mut s = base(kitty_font_size().unwrap_or(12.0), kitty_shell());
+    if let Some(v) = read_toml(&config_home().join("niruterm/config.toml")) {
+        apply_config(&mut s, &v);
+    }
+    s
+}
+
+/// The defaults, with kitty's font size and shell.
+fn base(font_size: f32, shell: Option<String>) -> Settings {
+    Settings {
         font: None,
-        font_size: kitty_font_size().unwrap_or(12.0),
+        font_size,
         padding: 10,
         line_height: 1.0,
-        shell: kitty_shell(),
+        shell,
         scrollback: 10_000,
         copy_on_select: true,
         cursor_blink: false,
         cursor: Cursor::Beam,
+        notify_after: 10,
+        editor: None,
         overrides: Vec::new(),
-    };
-    let Some(v) = read_toml(&config_home().join("niruterm/config.toml")) else {
-        return s;
-    };
+    }
+}
+
+/// The keys of config.toml on top of the defaults.
+fn apply_config(s: &mut Settings, v: &toml::Value) {
     if let Some(f) = v.get("font").and_then(|x| x.as_str()) {
         s.font = Some(f.to_string());
     }
@@ -221,6 +238,12 @@ pub fn settings() -> Settings {
     if let Some(b) = v.get("cursor_blink").and_then(|x| x.as_bool()) {
         s.cursor_blink = b;
     }
+    if let Some(n) = v.get("notify_after").and_then(|x| x.as_integer()) {
+        s.notify_after = n.max(0) as u64;
+    }
+    if let Some(e) = v.get("editor").and_then(|x| x.as_str()) {
+        s.editor = Some(e.to_string()).filter(|e| !e.trim().is_empty());
+    }
     if let Some(c) = v.get("cursor").and_then(|x| x.as_str()) {
         s.cursor = match c {
             "block" => Cursor::Block,
@@ -235,7 +258,6 @@ pub fn settings() -> Settings {
             }
         }
     }
-    s
 }
 
 /// The xterm 256-colour palette above the 16 theme colours.
@@ -280,6 +302,19 @@ mod tests {
         assert_eq!(p.ansi[1], 0xff0000);
         assert_eq!(p.ansi[15], 0xffffff);
         assert_eq!(p.sel_bg, 0x333333);
+    }
+
+    #[test]
+    fn notification_time_and_editor_from_the_config() {
+        let mut s = base(12.0, None);
+        assert_eq!(s.notify_after, 10);
+        let v: toml::Value = "notify_after = 0\neditor = \"nvim\"\nscrollback = 500\n"
+            .parse()
+            .unwrap();
+        apply_config(&mut s, &v);
+        assert_eq!(s.notify_after, 0);
+        assert_eq!(s.editor.as_deref(), Some("nvim"));
+        assert_eq!(s.scrollback, 500);
     }
 
     #[test]

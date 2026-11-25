@@ -5,8 +5,11 @@ mod font;
 mod graphics;
 mod icat;
 mod image;
+mod marks;
+mod open;
 mod palette;
 mod term;
+mod text;
 mod x;
 
 const HELP: &str = "NIRUTERM: the NIRU terminal
@@ -25,11 +28,15 @@ const HELP: &str = "NIRUTERM: the NIRU terminal
 Keys: Ctrl+Shift+C/V copy/paste · Shift+Insert paste the selection
       Ctrl+Shift+N new window here · Ctrl+Shift+Plus/Minus/0 font size
       Shift+PgUp/PgDn/Home/End history · Ctrl+click open a link
+      Ctrl+Shift+F search the history (Enter older, Shift+Enter newer, Esc)
+      Ctrl+Shift+E hints: type a label to open a link or path:line
+      Ctrl+Shift+Up/Down previous/next prompt · Ctrl+Shift+G copy the
+      last command's output (prompt marks from niruprompt, OSC 133)
 Mouse: select to copy · double-click a word · triple-click a line
        middle-click pastes · Shift overrides programs that use the mouse
 Config: ~/.config/niruterm/config.toml (font, font_size, padding, shell,
-        scrollback, cursor, cursor_blink, copy_on_select, [colors]).
-        Colours follow the NIRUX theme.";
+        scrollback, cursor, cursor_blink, copy_on_select, notify_after,
+        editor, [colors]). Colours follow the NIRUX theme.";
 
 fn main() {
     let started = std::time::Instant::now();

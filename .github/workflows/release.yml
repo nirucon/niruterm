@@ -16,7 +16,7 @@ jobs:
       - name: Install musl and X11 test tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools xvfb xdotool x11-utils imagemagick fonts-dejavu-core
+          sudo apt-get install -y musl-tools xvfb xdotool x11-utils xclip imagemagick fonts-dejavu-core
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked -- --test-threads=1

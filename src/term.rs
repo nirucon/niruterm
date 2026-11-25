@@ -2,12 +2,14 @@
 //! feeds its output to alacritty_terminal's parser. Graphics commands are
 //! taken out of the stream first (see graphics.rs). Replies the terminal
 //! owes the program (cursor position, colours, images) go straight back to
-//! the PTY from the thread.
+//! the PTY from the thread. The shell's prompt marks (OSC 133) are kept in
+//! `marks` (see marks.rs).
 use crate::graphics::{Action, Piece, Placement, Scanner, Store};
+use crate::marks::{Finished, Marks};
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty::{self, Options, Shell};
 use alacritty_terminal::vte::ansi::Processor;
 use std::io::{Read, Write};
@@ -23,6 +25,8 @@ pub enum Note {
         Arc<dyn Fn(&str) -> String + Sync + Send>,
     ),
     Bell,
+    /// A command marked by the shell has finished.
+    Finished(Finished),
     Exit,
 }
 
@@ -96,6 +100,8 @@ impl EventListener for Listener {
 pub struct Session {
     pub term: Arc<FairMutex<Term<Listener>>>,
     pub graphics: Arc<Mutex<Store>>,
+    /// The prompt marks. Locked after `term` when both are needed.
+    pub marks: Arc<Mutex<Marks>>,
     pub listener: Listener,
     pty: Arc<Mutex<tty::Pty>>,
     pub size: Arc<Mutex<WindowSize>>,
@@ -178,6 +184,7 @@ impl Session {
             size: size_shared.clone(),
             colors,
         };
+        let history = spawn.scrollback;
         let config = Config {
             scrolling_history: spawn.scrollback,
             ..Default::default()
@@ -188,14 +195,26 @@ impl Session {
         };
         let term = Arc::new(FairMutex::new(Term::new(config, &dims, listener.clone())));
         let graphics = Arc::new(Mutex::new(Store::default()));
+        let marks = Arc::new(Mutex::new(Marks::default()));
         let session = Session {
             term: term.clone(),
             graphics: graphics.clone(),
+            marks: marks.clone(),
             listener: listener.clone(),
             pty: Arc::new(Mutex::new(pty)),
             size: size_shared.clone(),
         };
-        std::thread::spawn(move || reader(read_file, term, graphics, listener, size_shared));
+        std::thread::spawn(move || {
+            reader(
+                read_file,
+                term,
+                graphics,
+                marks,
+                listener,
+                size_shared,
+                history,
+            )
+        });
         Ok(session)
     }
 
@@ -225,7 +244,22 @@ impl Session {
             cols: size.num_cols as usize,
             lines: size.num_lines as usize,
         };
-        self.term.lock().resize(dims);
+        let mut t = self.term.lock();
+        let alt = t.mode().contains(TermMode::ALT_SCREEN);
+        match self.marks.lock() {
+            Ok(mut m) if !m.is_empty() => {
+                if alt {
+                    // The main screen is rewrapped out of sight.
+                    m.clear();
+                    t.resize(dims);
+                } else {
+                    let saved = m.before_resize(t.grid());
+                    t.resize(dims);
+                    m.after_resize(t.grid(), saved);
+                }
+            }
+            _ => t.resize(dims),
+        }
     }
 
     /// The shell's current folder (for "new window here").
@@ -239,8 +273,10 @@ fn reader(
     mut file: std::fs::File,
     term: Arc<FairMutex<Term<Listener>>>,
     graphics: Arc<Mutex<Store>>,
+    marks_arc: Arc<Mutex<Marks>>,
     listener: Listener,
     size: Arc<Mutex<WindowSize>>,
+    history: usize,
 ) {
     let mut parser: Processor = Processor::new();
     let mut scanner = Scanner::default();
@@ -264,30 +300,50 @@ fn reader(
         };
         let mut t = term.lock();
         let mut pieces: Vec<Vec<u8>> = Vec::new();
-        let mut text_runs: Vec<(usize, usize)> = Vec::new();
         // Collect first: the scanner borrows the buffer.
-        let mut order: Vec<Result<(usize, usize), usize>> = Vec::new();
+        let mut order: Vec<Item> = Vec::new();
         let base = buf.as_ptr() as usize;
         scanner.feed(&buf[..n], |p| match p {
-            Piece::Text(s) => {
-                let start = s.as_ptr() as usize - base;
-                text_runs.push((start, s.len()));
-                order.push(Ok((start, s.len())));
-            }
+            Piece::Text(s) => order.push(Item::Text(s.as_ptr() as usize - base, s.len())),
             Piece::Owned(v) => {
                 pieces.push(v);
-                order.push(Err(pieces.len() - 1 + (1 << 30)));
+                order.push(Item::Owned(pieces.len() - 1));
             }
             Piece::Command(c) => {
                 pieces.push(c);
-                order.push(Err(pieces.len() - 1));
+                order.push(Item::Command(pieces.len() - 1));
+            }
+            Piece::Mark(m) => {
+                pieces.push(m);
+                order.push(Item::Mark(pieces.len() - 1));
             }
         });
+        // Marks are moved with the output only once the shell has sent one.
+        let mut marks = marks_arc.lock().ok();
+        let had_marks = marks.as_ref().is_some_and(|m| !m.is_empty());
+        if let Some(m) = marks.as_mut().filter(|_| had_marks) {
+            // Rows are reused once the history is full: one read that
+            // scrolls through all of them leaves the marks nowhere.
+            let g = t.grid();
+            let ring = history + g.screen_lines();
+            if n >= ring && !t.mode().contains(TermMode::ALT_SCREEN) {
+                let newlines = buf[..n].iter().filter(|b| **b == b'\n').count();
+                m.flood(n, newlines, g.columns(), ring);
+            }
+        }
         for item in order {
             match item {
-                Ok((s, l)) => parser.advance(&mut *t, &buf[s..s + l]),
-                Err(k) if k >= 1 << 30 => parser.advance(&mut *t, &pieces[k - (1 << 30)]),
-                Err(k) => {
+                Item::Text(s, l) => parser.advance(&mut *t, &buf[s..s + l]),
+                Item::Owned(k) => parser.advance(&mut *t, &pieces[k]),
+                Item::Mark(k) => {
+                    if t.mode().contains(TermMode::ALT_SCREEN) {
+                        continue;
+                    }
+                    if let Some(f) = marks.as_mut().and_then(|m| m.record(&pieces[k], &t)) {
+                        listener.send(Note::Finished(f));
+                    }
+                }
+                Item::Command(k) => {
                     let cell = size
                         .lock()
                         .map(|s| (s.cell_width as u32, s.cell_height as u32))
@@ -333,8 +389,22 @@ fn reader(
                 }
             }
         }
+        if let Some(m) = marks.as_mut().filter(|m| !m.is_empty()) {
+            if !t.mode().contains(TermMode::ALT_SCREEN) {
+                m.sync(t.grid());
+            }
+        }
+        drop(marks);
         drop(t);
         poke(listener.wake);
     }
     listener.send(Note::Exit);
+}
+
+/// One piece of a read, in order.
+enum Item {
+    Text(usize, usize),
+    Owned(usize),
+    Command(usize),
+    Mark(usize),
 }

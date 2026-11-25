@@ -214,6 +214,20 @@ impl X {
         Ok(())
     }
 
+    /// The ICCCM urgency flag in WM_HINTS (NIRUWM and NIRUBAR show the
+    /// workspace as urgent), with the input hint every terminal sets.
+    pub fn set_urgent(&self, on: bool) -> Res<()> {
+        self.c.change_property32(
+            PropMode::REPLACE,
+            self.win,
+            AtomEnum::WM_HINTS,
+            AtomEnum::WM_HINTS,
+            &wm_hints(on),
+        )?;
+        self.c.flush()?;
+        Ok(())
+    }
+
     /// `_NET_WM_ICON`: width, height, then ARGB pixels, for every size.
     pub fn set_icon(&self, sizes: &[(u32, u32, Vec<u32>)]) -> Res<()> {
         let mut data = Vec::new();
@@ -782,4 +796,11 @@ pub fn wm_class(class: &str) -> Vec<u8> {
         v.push(0);
     }
     v
+}
+
+/// WM_HINTS (ICCCM 4.1.2.4): flags, input, then fields NIRUTERM leaves
+/// unset. InputHint is 1, UrgencyHint 256.
+pub fn wm_hints(urgent: bool) -> [u32; 9] {
+    let flags = 1 | if urgent { 256 } else { 0 };
+    [flags, 1, 0, 0, 0, 0, 0, 0, 0]
 }
