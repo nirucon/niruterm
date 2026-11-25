@@ -184,8 +184,13 @@ impl Marks {
                     .take_while(|m| m.kind != Kind::Prompt)
                     .find(|m| m.kind == Kind::Input)
                     .copied();
-                self.command = input
-                    .map(|b| text_between(term, Point::new(Line(b.line), Column(b.col)), at))
+                // fish 4 sends no B but names the command in C (`cmdline_url=`).
+                self.command = cmdline(params)
+                    .or_else(|| {
+                        input.map(|b| {
+                            text_between(term, Point::new(Line(b.line), Column(b.col)), at)
+                        })
+                    })
                     .map(|s| s.trim().chars().take(200).collect())
                     .unwrap_or_default();
                 self.running = Some(Instant::now());
@@ -311,6 +316,36 @@ impl Marks {
         }
         self.anchor = (!self.list.is_empty()).then(|| row_id(grid, bottom(grid)));
     }
+}
+
+/// The command line a shell put in its C mark: `cmdline_url=` (percent
+/// encoded, as fish 4 sends it) or `cmdline=`.
+fn cmdline(params: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(params).ok()?;
+    for field in text.split(';').skip(1) {
+        if let Some(v) = field.strip_prefix("cmdline_url=") {
+            let b = v.as_bytes();
+            let mut out = Vec::with_capacity(b.len());
+            let mut i = 0;
+            while i < b.len() {
+                let hex = |c: u8| (c as char).to_digit(16);
+                if b[i] == b'%' && i + 2 < b.len() {
+                    if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                        out.push((h * 16 + l) as u8);
+                        i += 3;
+                        continue;
+                    }
+                }
+                out.push(b[i]);
+                i += 1;
+            }
+            return Some(String::from_utf8_lossy(&out).into_owned());
+        }
+        if let Some(v) = field.strip_prefix("cmdline=") {
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -470,5 +505,16 @@ mod tests {
         });
         m.flood(65536, 100, 80, 10_040);
         assert!(!m.is_empty());
+    }
+
+    #[test]
+    fn fish_4_names_the_command_in_its_c_mark() {
+        assert_eq!(
+            cmdline(b"C;cmdline_url=sleep%2010%3B%20echo%20%C3%A5"),
+            Some("sleep 10; echo \u{e5}".to_string())
+        );
+        assert_eq!(cmdline(b"C;cmdline=make"), Some("make".to_string()));
+        assert_eq!(cmdline(b"C"), None);
+        assert_eq!(cmdline(b"C;cmdline_url=100%"), Some("100%".to_string()));
     }
 }
