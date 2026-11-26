@@ -51,6 +51,12 @@ pub struct Settings {
     pub notify_after: u64,
     /// The editor for `path:line` hints (else $VISUAL or $EDITOR).
     pub editor: Option<String>,
+    /// Ask before a paste that would run at once or looks dangerous.
+    pub paste_protection: bool,
+    /// Programming ligatures (`->`, `!=`, `=>`) from the font.
+    pub ligatures: bool,
+    /// The scratchpad (class `scratchpad`) starts in its last folder.
+    pub remember_folder: bool,
     pub overrides: Vec<(String, u32)>,
 }
 
@@ -65,6 +71,14 @@ pub fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// `$XDG_STATE_HOME`, else `~/.local/state`.
+pub fn state_home() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home().join(".local/state"))
 }
 
 pub fn config_home() -> PathBuf {
@@ -205,6 +219,9 @@ fn base(font_size: f32, shell: Option<String>) -> Settings {
         cursor: Cursor::Beam,
         notify_after: 10,
         editor: None,
+        paste_protection: true,
+        ligatures: false,
+        remember_folder: true,
         overrides: Vec::new(),
     }
 }
@@ -243,6 +260,15 @@ fn apply_config(s: &mut Settings, v: &toml::Value) {
     }
     if let Some(e) = v.get("editor").and_then(|x| x.as_str()) {
         s.editor = Some(e.to_string()).filter(|e| !e.trim().is_empty());
+    }
+    for (key, value) in [
+        ("paste_protection", &mut s.paste_protection),
+        ("ligatures", &mut s.ligatures),
+        ("remember_folder", &mut s.remember_folder),
+    ] {
+        if let Some(b) = v.get(key).and_then(|x| x.as_bool()) {
+            *value = b;
+        }
     }
     if let Some(c) = v.get("cursor").and_then(|x| x.as_str()) {
         s.cursor = match c {
@@ -315,6 +341,18 @@ mod tests {
         assert_eq!(s.notify_after, 0);
         assert_eq!(s.editor.as_deref(), Some("nvim"));
         assert_eq!(s.scrollback, 500);
+    }
+
+    #[test]
+    fn paste_protection_ligatures_and_the_scratchpad_folder_from_the_config() {
+        let mut s = base(12.0, None);
+        assert!(s.paste_protection && !s.ligatures && s.remember_folder);
+        let v: toml::Value =
+            "paste_protection = false\nligatures = true\nremember_folder = false\n"
+                .parse()
+                .unwrap();
+        apply_config(&mut s, &v);
+        assert!(!s.paste_protection && s.ligatures && !s.remember_folder);
     }
 
     #[test]

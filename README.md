@@ -40,6 +40,25 @@ Measured on the same machine in the same X server (Debian 13).
   programs that use the mouse (vim, htop) get it, and Shift overrides them.
 - **Clipboard** shared with every program (CLIPBOARD and the selection), safe
   bracketed paste, OSC 52 from programs over SSH.
+- **Paste protection:** a paste that would run at once (a line break while
+  the program has no bracketed paste) or that uses `sudo`, `su`, `doas`,
+  `pkexec` or pipes a download into a shell (`curl ... | sh`) is shown in a
+  box with its first lines: Enter pastes it, Esc cancels. A single ordinary
+  line is pasted at once, as is any paste into a shell with bracketed paste
+  unless it is one of the dangerous kinds; full-screen programs with
+  bracketed paste (editors) are never interrupted. Middle-click and
+  Shift+Insert are checked the same way.
+- **New window in the same folder:** Ctrl+Shift+N opens a NIRUTERM in the
+  folder the shell is in: the one it reports (OSC 7, sent by NIRUPROMPT and
+  fish), else the folder of the program in the foreground.
+- **The scratchpad remembers its folder:** the NIRUWM scratchpad
+  (`niruterm --class scratchpad`) opens in the folder it had last, after a
+  restart or a new login. Only the path is kept, in
+  `~/.local/state/niruterm/scratchpad-folder`.
+- **Ligatures** for programming fonts (JetBrains Mono, Fira Code, Cascadia
+  Code), off by default: `ligatures = true` joins operators such as `->`,
+  `=>`, `!=`, `===`, `<=` and `&&` with the font's own rules. Only runs of
+  symbols are joined, never letters, and every glyph stays on its cells.
 - **Links:** Ctrl+click opens a URL or an OSC 8 link.
 - **Keyboard hints:** Ctrl+Shift+E puts a letter on every link and file
   path on the screen; typing it opens a link with `xdg-open` and a
@@ -76,6 +95,7 @@ right after the options; `-o` is ignored), so `kitty` can be replaced by
 |---|---|
 | Ctrl+Shift+C, Ctrl+Shift+V | copy, paste |
 | Shift+Insert, middle-click | paste the selection |
+| Enter, Esc | paste or cancel a paste that waits in its box |
 | Ctrl+Shift+N | new window in the same folder |
 | Ctrl+Shift+Plus, Minus, 0 | font size |
 | Shift+PgUp, PgDn, Home, End | history |
@@ -104,11 +124,17 @@ cursor_blink = false
 copy_on_select = true
 notify_after = 10                   # seconds; 0 turns notifications off
 editor = "nvim"                     # for path:line hints; else $VISUAL, $EDITOR
+paste_protection = true             # ask before a paste that runs at once or uses sudo
+ligatures = false                   # programming ligatures (->, !=, =>) from the font
+remember_folder = true              # the scratchpad opens in its last folder
 
 [colors]                            # on top of the NIRUX theme
 background = "#101010"
 color4 = "#88aacc"
 ```
+
+`ligatures` is read when the window opens. With ligatures on, a block
+cursor shows the plain character under it.
 
 A text file from a hint opens in the editor in a new NIRUTERM window, or in
 its own window for editors that have one (VS Code, gedit, Kate and others);
@@ -127,9 +153,9 @@ niruprompt alias list|add NAME COMMAND|rm NAME
 ```
 
 - **Shell integration:** the prompt carries the OSC 133 marks (where the
-  prompt, the command and its output start, and the exit status), which
-  NIRUTERM, kitty, foot and WezTerm understand. They are left out on the
-  Linux console.
+  prompt, the command and its output start, and the exit status) and the
+  folder (OSC 7), which NIRUTERM, kitty, foot and WezTerm understand. They
+  are left out on the Linux console.
 - **Prompt styles** in the theme's own colours: the folder, the git branch
   (and `*` for changes, with a 150 ms limit so big repositories never slow it
   down), the time of the last long command, background jobs, the Python

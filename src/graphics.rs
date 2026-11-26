@@ -3,8 +3,9 @@
 //! scanned for these sequences before the terminal parser sees it; images are
 //! decoded on the reader thread and placed at the cursor, anchored to their
 //! grid line so they scroll with the text. The same scanner takes out the
-//! shell's semantic prompt marks (OSC 133, see marks.rs); every other escape
-//! sequence goes to the terminal parser unchanged.
+//! shell's semantic prompt marks (OSC 133, see marks.rs) and the folder the
+//! shell reports (OSC 7); every other escape sequence goes to the terminal
+//! parser unchanged.
 use crate::canvas::Image;
 use std::collections::HashMap;
 
@@ -14,14 +15,18 @@ use std::collections::HashMap;
 #[derive(Default)]
 pub struct Scanner {
     // 0 text, 1 saw ESC, 2 in APC, 3 in APC saw ESC, 4 in an OSC that may be
-    // 133, 5 in OSC 133, 6 in OSC 133 saw ESC.
+    // 133 or 7, 5 in OSC 133 or 7, 6 in OSC 133 or 7 saw ESC.
     state: u8,
     apc: Vec<u8>,
     osc: Vec<u8>,
+    /// The OSC being kept is a folder (7), not a prompt mark (133).
+    cwd: bool,
 }
 
 /// The start of a semantic prompt mark: `ESC ] 133 ;`.
 const MARK: &[u8] = b"133;";
+/// The start of the shell's folder: `ESC ] 7 ;` (`file://host/path`).
+const CWD: &[u8] = b"7;";
 
 pub enum Piece<'a> {
     Text(&'a [u8]),
@@ -29,6 +34,8 @@ pub enum Piece<'a> {
     Command(Vec<u8>),
     /// An OSC 133 mark: what follows `133;` (`A`, `B`, `C`, `D;0`).
     Mark(Vec<u8>),
+    /// An OSC 7 folder: what follows `7;` (`file://host/path`).
+    Cwd(Vec<u8>),
 }
 
 impl Scanner {
@@ -87,7 +94,7 @@ impl Scanner {
                 }
                 4 => {
                     self.osc.push(b);
-                    if !MARK.starts_with(&self.osc) {
+                    if !MARK.starts_with(&self.osc) && !CWD.starts_with(&self.osc) {
                         // Another OSC (title, colours, links): the parser's.
                         let mut v = Vec::with_capacity(self.osc.len() + 1);
                         v.extend_from_slice(b"\x1b]");
@@ -97,7 +104,8 @@ impl Scanner {
                         start = i;
                         continue;
                     }
-                    if self.osc.len() == MARK.len() {
+                    if self.osc == MARK || self.osc == CWD {
+                        self.cwd = self.osc == CWD;
                         self.osc.clear();
                         self.state = 5;
                     }
@@ -133,7 +141,12 @@ impl Scanner {
 
     fn finish_mark(&mut self, out: &mut impl FnMut(Piece)) {
         self.state = 0;
-        out(Piece::Mark(std::mem::take(&mut self.osc)));
+        let osc = std::mem::take(&mut self.osc);
+        out(if self.cwd {
+            Piece::Cwd(osc)
+        } else {
+            Piece::Mark(osc)
+        });
     }
 
     fn finish(&mut self, out: &mut impl FnMut(Piece)) {
@@ -484,6 +497,7 @@ mod tests {
                 Piece::Owned(t) => text.extend_from_slice(&t),
                 Piece::Command(c) => cmds.push(c),
                 Piece::Mark(_) => panic!("no mark here"),
+                Piece::Cwd(_) => panic!("no folder here"),
             });
         }
         assert_eq!(text, b"abcd\x1b[1m");
@@ -508,6 +522,7 @@ mod tests {
                 Piece::Owned(t) => text.extend_from_slice(&t),
                 Piece::Command(_) => panic!("no graphics here"),
                 Piece::Mark(m) => marks.push(m),
+                Piece::Cwd(_) => panic!("no folder here"),
             });
         }
         assert_eq!(
@@ -515,6 +530,26 @@ mod tests {
             b"ab\x1b]0;title\x07cd\x1b]13x\x1b[0m\x1b]8;;http://x\x07e"
         );
         assert_eq!(marks, vec![b"A".to_vec(), b"D;1".to_vec(), b"C".to_vec()]);
+    }
+
+    #[test]
+    fn the_folder_report_is_taken_out_even_split_over_reads() {
+        let mut sc = Scanner::default();
+        let mut text = Vec::new();
+        let mut dirs = Vec::new();
+        for chunk in [
+            &b"a\x1b]7;file://h/tm"[..],
+            b"p/x%20y\x1b\\b\x1b]777;n\x07c",
+        ] {
+            sc.feed(chunk, |p| match p {
+                Piece::Text(t) => text.extend_from_slice(t),
+                Piece::Owned(t) => text.extend_from_slice(&t),
+                Piece::Cwd(d) => dirs.push(d),
+                _ => panic!("no graphics or marks here"),
+            });
+        }
+        assert_eq!(dirs, vec![b"file://h/tmp/x%20y".to_vec()]);
+        assert_eq!(text, b"ab\x1b]777;n\x07c");
     }
 
     #[test]

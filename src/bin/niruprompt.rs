@@ -414,6 +414,22 @@ fn with_marks(prompt: &str, bash: bool) -> String {
     format!("{open}\x1b]133;A\x07{close}{prompt}{open}\x1b]133;B\x07{close}")
 }
 
+/// OSC 7: the folder the shell is in, as `file://host/path`, for "new
+/// window in the same folder" (NIRUTERM, kitty, foot, WezTerm).
+fn folder_report(host: &str, cwd: &Path, bash: bool) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let (open, close) = if bash { ("\x01", "\x02") } else { ("", "") };
+    let mut path = String::new();
+    for &b in cwd.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"/-_.~".contains(&b) {
+            path.push(b as char);
+        } else {
+            path.push_str(&format!("%{b:02X}"));
+        }
+    }
+    format!("{open}\x1b]7;file://{host}{path}\x07{close}")
+}
+
 // -------------------------------------------------------------- aliases
 
 /// Defaults everybody gets; the user's aliases.toml wins.
@@ -706,6 +722,9 @@ fn main() {
             let mut p = render(&f, &style(), bash);
             if marks {
                 p = with_marks(&p, bash);
+                if let Ok(cwd) = std::env::current_dir() {
+                    p = format!("{}{p}", folder_report(&hostname(), &cwd, bash));
+                }
             }
             let _ = out.write_all(p.as_bytes());
             0
@@ -812,6 +831,19 @@ mod tests {
         assert_eq!(p.matches('\x01').count(), p.matches('\x1b').count());
         let fish = with_marks("❯ ", false);
         assert_eq!(fish, "\x1b]133;A\x07❯ \x1b]133;B\x07");
+    }
+
+    #[test]
+    fn the_folder_is_reported_percent_encoded_and_hidden_from_bash() {
+        let p = folder_report("yggdrasil", Path::new("/home/u/my dir/å"), true);
+        assert_eq!(
+            p,
+            "\x01\x1b]7;file://yggdrasil/home/u/my%20dir/%C3%A5\x07\x02"
+        );
+        assert_eq!(
+            folder_report("h", Path::new("/tmp"), false),
+            "\x1b]7;file://h/tmp\x07"
+        );
     }
 
     #[test]

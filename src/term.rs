@@ -3,7 +3,7 @@
 //! taken out of the stream first (see graphics.rs). Replies the terminal
 //! owes the program (cursor position, colours, images) go straight back to
 //! the PTY from the thread. The shell's prompt marks (OSC 133) are kept in
-//! `marks` (see marks.rs).
+//! `marks` (see marks.rs), the folder it reports (OSC 7) in `reported`.
 use crate::graphics::{Action, Piece, Placement, Scanner, Store};
 use crate::marks::{Finished, Marks};
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -27,6 +27,8 @@ pub enum Note {
     Bell,
     /// A command marked by the shell has finished.
     Finished(Finished),
+    /// The shell reported a new folder on this machine (OSC 7).
+    Cwd(std::path::PathBuf),
     Exit,
 }
 
@@ -105,6 +107,8 @@ pub struct Session {
     pub listener: Listener,
     pty: Arc<Mutex<tty::Pty>>,
     pub size: Arc<Mutex<WindowSize>>,
+    /// The last folder the shell reported with OSC 7.
+    reported: Arc<Mutex<Option<std::path::PathBuf>>>,
 }
 
 /// Grid size for the terminal model.
@@ -196,6 +200,7 @@ impl Session {
         let term = Arc::new(FairMutex::new(Term::new(config, &dims, listener.clone())));
         let graphics = Arc::new(Mutex::new(Store::default()));
         let marks = Arc::new(Mutex::new(Marks::default()));
+        let reported = Arc::new(Mutex::new(None));
         let session = Session {
             term: term.clone(),
             graphics: graphics.clone(),
@@ -203,18 +208,17 @@ impl Session {
             listener: listener.clone(),
             pty: Arc::new(Mutex::new(pty)),
             size: size_shared.clone(),
+            reported: reported.clone(),
         };
-        std::thread::spawn(move || {
-            reader(
-                read_file,
-                term,
-                graphics,
-                marks,
-                listener,
-                size_shared,
-                history,
-            )
-        });
+        let shared = Shared {
+            term,
+            graphics,
+            marks,
+            reported,
+            listener,
+            size: size_shared,
+        };
+        std::thread::spawn(move || reader(read_file, shared, history));
         Ok(session)
     }
 
@@ -262,22 +266,71 @@ impl Session {
         }
     }
 
-    /// The shell's current folder (for "new window here").
+    /// The folder of what runs in the terminal (for "new window here"):
+    /// the one the shell reported (OSC 7) while the shell itself is in the
+    /// foreground, else the folder of the program in the foreground, else
+    /// the shell's own.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
-        let pid = self.pty.lock().ok()?.child().id();
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        let (shell, fg) = {
+            use std::os::fd::AsRawFd;
+            let p = self.pty.lock().ok()?;
+            let fg = unsafe { libc::tcgetpgrp(p.file().as_raw_fd()) };
+            (p.child().id() as i32, fg)
+        };
+        let reported = self.reported.lock().ok().and_then(|r| r.clone());
+        let proc_cwd = |pid: i32| std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+        if fg <= 0 || fg == shell {
+            if let Some(d) = reported.clone().filter(|d| d.is_dir()) {
+                return Some(d);
+            }
+        } else if let Some(d) = proc_cwd(fg) {
+            return Some(d);
+        }
+        proc_cwd(shell).or(reported)
     }
 }
 
-fn reader(
-    mut file: std::fs::File,
+/// What the reader thread shares with the window.
+struct Shared {
     term: Arc<FairMutex<Term<Listener>>>,
     graphics: Arc<Mutex<Store>>,
-    marks_arc: Arc<Mutex<Marks>>,
+    marks: Arc<Mutex<Marks>>,
+    reported: Arc<Mutex<Option<std::path::PathBuf>>>,
     listener: Listener,
     size: Arc<Mutex<WindowSize>>,
-    history: usize,
-) {
+}
+
+/// The folder in an OSC 7 report (`file://host/path`, percent-encoded) when
+/// it is on this machine: a report from a shell over SSH names a folder on
+/// the other machine.
+pub fn reported_folder(params: &[u8], host: &str) -> Option<std::path::PathBuf> {
+    let s = std::str::from_utf8(params).ok()?;
+    let rest = s.strip_prefix("file://")?;
+    let slash = rest.find('/')?;
+    let (h, path) = rest.split_at(slash);
+    if !(h.is_empty() || h.eq_ignore_ascii_case("localhost") || h.eq_ignore_ascii_case(host)) {
+        return None;
+    }
+    Some(crate::x::decode_path(path))
+}
+
+/// This machine's name, as shells put it in OSC 7.
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn reader(mut file: std::fs::File, shared: Shared, history: usize) {
+    let Shared {
+        term,
+        graphics,
+        marks: marks_arc,
+        reported,
+        listener,
+        size,
+    } = shared;
+    let host = hostname();
     let mut parser: Processor = Processor::new();
     let mut scanner = Scanner::default();
     let mut buf = vec![0u8; 1 << 16];
@@ -316,6 +369,16 @@ fn reader(
             Piece::Mark(m) => {
                 pieces.push(m);
                 order.push(Item::Mark(pieces.len() - 1));
+            }
+            Piece::Cwd(c) => {
+                if let Some(d) = reported_folder(&c, &host) {
+                    if let Ok(mut r) = reported.lock() {
+                        if r.as_ref() != Some(&d) {
+                            *r = Some(d.clone());
+                            listener.send(Note::Cwd(d));
+                        }
+                    }
+                }
             }
         });
         // Marks are moved with the output only once the shell has sent one.
@@ -407,4 +470,24 @@ enum Item {
     Owned(usize),
     Command(usize),
     Mark(usize),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_folder_report_counts_only_from_this_machine() {
+        let r = |s: &str| reported_folder(s.as_bytes(), "yggdrasil");
+        assert_eq!(r("file:///tmp/a%20b"), Some(PathBuf::from("/tmp/a b")));
+        assert_eq!(r("file://localhost/srv"), Some(PathBuf::from("/srv")));
+        assert_eq!(
+            r("file://YGGDRASIL/home/%C3%A5"),
+            Some(PathBuf::from("/home/å"))
+        );
+        assert_eq!(r("file://othala/home/x"), None);
+        assert_eq!(r("http://yggdrasil/x"), None);
+        assert_eq!(r("file://yggdrasil"), None);
+    }
 }

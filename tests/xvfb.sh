@@ -2,7 +2,9 @@
 # End-to-end checks in a private Xvfb: first frame, typing through the PTY,
 # a picture through the kitty graphics protocol (icat), resizing and exit;
 # shell integration with NIRUPROMPT (prompt jumps, the last output), the
-# history search, keyboard hints, notifications and the urgency flag.
+# history search, keyboard hints, notifications and the urgency flag; the
+# paste confirmation, a new window in the same folder and the scratchpad's
+# folder across restarts.
 # Everything runs with HOME and the XDG folders in a temporary folder.
 # Usage: tests/xvfb.sh PATH/TO/niruterm (niruprompt next to it)
 set -eu
@@ -24,6 +26,20 @@ PIDS="$PIDS $!"
 export DISPLAY=$D
 sleep 1
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# The root window (1280x800) as raw RGB, with ImageMagick or else ffmpeg.
+grab() {
+    if command -v import >/dev/null 2>&1; then
+        import -window root -depth 8 "rgb:$1"
+    else
+        ffmpeg -loglevel error -y -f x11grab -video_size 1280x800 -i "$DISPLAY" \
+            -frames:v 1 -f rawvideo -pix_fmt rgb24 "$1"
+    fi
+}
+# The colour of one pixel of the screen, as rrggbb.
+pixel() {
+    grab "$SB/px.rgb"
+    python3 -c 'import sys; d = open(sys.argv[1], "rb").read(); i = (int(sys.argv[3]) * 1280 + int(sys.argv[2])) * 3; print(d[i:i + 3].hex())' "$SB/px.rgb" "$1" "$2"
+}
 # A 64x64 red PNG, written without any image tool.
 python3 - "$SB/red.png" <<'PY'
 import struct, sys, zlib
@@ -73,14 +89,14 @@ k "printf pass > $SB/typed"
 # The picture: drawn at the top left after clear.
 k "clear; $BIN icat $SB/red.png"
 sleep 0.6
-import -window "$W" -crop 1x1+20+20 txt:- > "$SB/px" 2>/dev/null || import -window root -crop 1x1+20+20 txt:- > "$SB/px"
-grep -qi 'FF0000\|255,0,0' "$SB/px" || fail "no picture at the top left: $(cat "$SB/px")"
+px=$(pixel 20 20)
+[ "$px" = ff0000 ] || fail "no picture at the top left: $px"
 # A new picture under the same id and size replaces the old one (NPLAY
 # showed the previous album cover after a track change).
 k "clear; python3 $SB/cover.py $SB/red.png; sleep 0.3; python3 $SB/cover.py $SB/blue.png"
 sleep 0.8
-import -window "$W" -crop 1x1+20+20 txt:- > "$SB/px2" 2>/dev/null || import -window root -crop 1x1+20+20 txt:- > "$SB/px2"
-grep -qi '0000FF\|0,0,255' "$SB/px2" || fail "the old picture stayed under a reused id: $(cat "$SB/px2")"
+px=$(pixel 20 20)
+[ "$px" = 0000ff ] || fail "the old picture stayed under a reused id: $px"
 # Resizing reaches the program as a new size.
 k "stty size > $SB/size1"
 xdotool windowsize "$W" 700 400
@@ -151,7 +167,7 @@ for y in range(800 - h):
         i = line.find(pat, i + 1)
 sys.exit(1)
 PY
-block() { import -window root -depth 8 "rgb:$SB/shot.rgb" && python3 "$SB/block.py" "$SB/shot.rgb" "$1"; }
+block() { grab "$SB/shot.rgb" && python3 "$SB/block.py" "$SB/shot.rgb" "$1"; }
 clip() { timeout 3 xclip -o -selection clipboard 2>/dev/null || true; }
 PATH="$SB/bin:$PATH" NIRUPROMPT_STYLE=ascii "$BIN" --class probe-int --working-directory "$HOME" \
     -e bash --rcfile "$SB/niru.bash" -i 2>>"$SB/err" &
@@ -252,4 +268,107 @@ k exit
 sleep 0.6
 if kill -0 "$I" 2>/dev/null; then fail 'the window stayed after exit'; fi
 echo "notifications and urgency ok"
+# ---------------------------------------------------------------- 0.3.0
+# Paste protection. sh has no bracketed paste: a paste with a line break
+# waits in a box (yellow, colour 3) until Enter, Esc drops it, a single line
+# goes straight through. bash has bracketed paste: several lines go straight
+# through, sudo waits in a red box (colour 1).
+printf '' > "$XDG_CONFIG_HOME/niruterm/config.toml"
+"$BIN" --class probe-paste -e sh 2>>"$SB/err" &
+P=$!
+PIDS="$PIDS $P"
+sleep 1.2
+PW=$(xdotool search --sync --onlyvisible --class probe-paste | head -1)
+xdotool windowmove "$PW" 0 0
+xdotool windowfocus --sync "$PW"
+setclip() { printf "$1" | xclip -selection "${2:-clipboard}" -i; sleep 0.3; }
+setclip "printf one > $SB/p1\nprintf two > $SB/p2\n"
+xdotool key ctrl+shift+v
+sleep 0.5
+[ ! -e "$SB/p1" ] || fail 'a paste with a line break ran without asking'
+block b5a47e || fail 'no paste confirmation'
+xdotool key Escape
+sleep 0.5
+if block b5a47e; then fail 'the confirmation stayed after Esc'; fi
+[ ! -e "$SB/p1" ] || fail 'Esc pasted anyway'
+xdotool key ctrl+shift+v
+sleep 0.4
+xdotool key Return
+sleep 0.6
+[ "$(cat "$SB/p1" "$SB/p2" 2>/dev/null)" = onetwo ] || fail 'Enter did not paste both lines'
+setclip "printf three > $SB/p3"
+xdotool key ctrl+shift+v
+sleep 0.4
+if block b5a47e; then fail 'a single line asked for confirmation'; fi
+xdotool key Return
+sleep 0.5
+[ "$(cat "$SB/p3" 2>/dev/null)" = three ] || fail 'a single line was not pasted'
+# Middle-click pastes the selection through the same check.
+setclip "printf four > $SB/p4\n" primary
+xdotool mousemove 300 300 click 2
+sleep 0.5
+block b5a47e || fail 'a middle-click paste with a line break did not ask'
+xdotool key Return
+sleep 0.5
+[ "$(cat "$SB/p4" 2>/dev/null)" = four ] || fail 'the middle-click paste was lost'
+xdotool type --delay 15 "exec bash --rcfile $SB/niru.bash -i"
+xdotool key Return
+sleep 0.8
+setclip "printf five > $SB/p5\nprintf six > $SB/p6"
+xdotool key ctrl+shift+v
+sleep 0.4
+if block b5a47e || block b87878; then fail 'bracketed paste asked about plain lines'; fi
+xdotool key Return
+sleep 0.5
+[ "$(cat "$SB/p5" "$SB/p6" 2>/dev/null)" = fivesix ] || fail 'the bracketed paste did not run'
+setclip "sudo -n true; printf seven > $SB/p7"
+xdotool key ctrl+shift+v
+sleep 0.4
+block b87878 || fail 'sudo did not ask'
+xdotool key Escape
+sleep 0.3
+xdotool key Return
+sleep 0.4
+[ ! -e "$SB/p7" ] || fail 'the sudo paste ran after Esc'
+echo "paste protection ok"
+# Ctrl+Shift+N opens a new window in the folder the shell is in (here
+# reported by NIRUPROMPT with OSC 7, the folder has a space).
+mkdir -p "$SB/my dir" "$SB/scratch dir"
+xdotool type --delay 15 "cd '$SB/my dir'"
+xdotool key Return
+sleep 0.3
+xdotool key ctrl+shift+n
+sleep 1.5
+NW=$(xdotool search --onlyvisible --class '^niruterm$' | head -1)
+[ -n "$NW" ] || fail 'Ctrl+Shift+N opened no window'
+xdotool windowmove "$NW" 0 0
+xdotool windowraise "$NW"
+xdotool windowfocus --sync "$NW"
+k "pwd > '$SB/new-pwd'; exit"
+[ "$(cat "$SB/new-pwd" 2>/dev/null)" = "$SB/my dir" ] || fail "the new window opened in '$(cat "$SB/new-pwd" 2>/dev/null)'"
+xdotool windowfocus --sync "$PW"
+k exit
+echo "new window in the same folder ok"
+# The scratchpad (class scratchpad) keeps the folder the shell reports and
+# opens there after a restart; other windows keep nothing.
+STATE=$XDG_STATE_HOME/niruterm/scratchpad-folder
+[ ! -e "$STATE" ] || fail 'a window that is not the scratchpad kept its folder'
+"$BIN" --class scratchpad -e bash --rcfile "$SB/niru.bash" -i 2>>"$SB/err" &
+PIDS="$PIDS $!"
+sleep 1.5
+SW=$(xdotool search --sync --onlyvisible --class scratchpad | head -1)
+xdotool windowmove "$SW" 0 0
+xdotool windowfocus --sync "$SW"
+k "cd '$SB/scratch dir'"
+[ "$(cat "$STATE" 2>/dev/null)" = "$SB/scratch dir" ] || fail "kept folder: '$(cat "$STATE" 2>/dev/null)'"
+k exit
+"$BIN" --class scratchpad -e bash --norc 2>>"$SB/err" &
+PIDS="$PIDS $!"
+sleep 1.2
+SW=$(xdotool search --sync --onlyvisible --class scratchpad | head -1)
+xdotool windowmove "$SW" 0 0
+xdotool windowfocus --sync "$SW"
+k "pwd > '$SB/scratch-pwd'; exit"
+[ "$(cat "$SB/scratch-pwd" 2>/dev/null)" = "$SB/scratch dir" ] || fail "the scratchpad opened in '$(cat "$SB/scratch-pwd" 2>/dev/null)'"
+echo "scratchpad folder ok"
 echo PASS

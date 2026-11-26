@@ -1,6 +1,7 @@
 //! The NIRUTERM window: drawing the grid, keys, mouse, selection, clipboard,
 //! images, theme and font changes; the history search, the keyboard hints,
-//! prompt jumps and notifications.
+//! prompt jumps and notifications; the paste confirmation, and the
+//! scratchpad's folder.
 use crate::canvas::{Canvas, Image, Rect};
 use crate::font::Fonts;
 use crate::palette::{self, Cursor, Palette, Settings};
@@ -62,6 +63,12 @@ struct Search {
     stale: bool,
 }
 
+/// A paste waiting for Enter (paste protection).
+struct Confirm {
+    text: String,
+    reason: crate::paste::Reason,
+}
+
 /// Keyboard hints (Ctrl+Shift+E): a label on every link and path.
 struct Hints {
     list: Vec<(String, crate::text::Hint)>,
@@ -115,6 +122,11 @@ pub struct App {
     urgent: bool,
     /// A short message at the top right, until the time.
     toast: Option<(String, Instant)>,
+    confirm: Option<Confirm>,
+    /// This window is the scratchpad and keeps its folder.
+    remember: bool,
+    /// The folder kept last for the scratchpad.
+    kept: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -129,12 +141,13 @@ impl App {
             opts.class.as_deref().unwrap_or(""),
         )?;
         let dpi = crate::font::dpi_scale(x.xft_dpi());
-        let fonts = Fonts::new(
+        let mut fonts = Fonts::new(
             settings.font.as_deref(),
             settings.font_size,
             dpi,
             settings.line_height,
         )?;
+        fonts.set_ligatures(settings.ligatures);
         let pad = settings.padding;
         let cols = ((1200 - 2 * pad) / fonts.cell_w).max(2) as usize;
         let lines = ((760 - 2 * pad) / fonts.cell_h).max(1) as usize;
@@ -167,6 +180,8 @@ impl App {
         let _ = x.set_icon(&window_icons(&pal));
         x.map()?;
         let points = settings.font_size;
+        let remember =
+            settings.remember_folder && opts.class.as_deref() == Some(crate::folder::SCRATCHPAD);
         Ok(App {
             cv: Canvas::new(1200, 760),
             x,
@@ -209,6 +224,9 @@ impl App {
             hints: None,
             urgent: false,
             toast: None,
+            confirm: None,
+            remember,
+            kept: None,
         })
     }
 
@@ -241,6 +259,10 @@ impl App {
 
     fn reload_theme(&mut self) {
         self.settings = palette::settings();
+        if self.fonts.ligatures() != self.settings.ligatures {
+            self.fonts.set_ligatures(self.settings.ligatures);
+            self.dirty = true;
+        }
         let p = palette::load(&self.settings);
         if p != self.pal {
             self.pal = p.clone();
@@ -254,6 +276,29 @@ impl App {
     // ---------------------------------------------------------------- loop
 
     pub fn run(&mut self) -> Res<()> {
+        let r = self.event_loop();
+        // Also when the X server went away at logout.
+        self.keep_folder(None);
+        r
+    }
+
+    /// The scratchpad keeps its folder for the next start: the one the shell
+    /// reported, or the one it is in now.
+    fn keep_folder(&mut self, reported: Option<std::path::PathBuf>) {
+        if !self.remember {
+            return;
+        }
+        let Some(dir) = reported.or_else(|| self.session.cwd()) else {
+            return;
+        };
+        if self.kept.as_ref() != Some(&dir)
+            && crate::folder::save(&crate::folder::file(), &dir).is_ok()
+        {
+            self.kept = Some(dir);
+        }
+    }
+
+    fn event_loop(&mut self) -> Res<()> {
         let xfd = {
             use std::os::fd::AsRawFd;
             self.x.c.stream().as_raw_fd()
@@ -420,6 +465,7 @@ impl App {
                     crate::open::notify(&summary, &body);
                 }
             }
+            Note::Cwd(dir) => self.keep_folder(Some(dir)),
             Note::Exit if self.hold => {
                 self.held = true;
                 self.dirty = true;
@@ -462,6 +508,8 @@ impl App {
             }
             Event::FocusOut(_) => {
                 self.focused = false;
+                // The scratchpad is hidden: a good moment to keep its folder.
+                self.keep_folder(None);
                 if self.mode().contains(TermMode::FOCUS_IN_OUT) {
                     self.session.write(b"\x1b[O");
                 }
@@ -537,6 +585,44 @@ impl App {
             s.query.push_str(text.lines().next().unwrap_or(""));
             return self.search_update();
         }
+        if text.is_empty() {
+            return;
+        }
+        if self.settings.paste_protection {
+            let mode = self.mode();
+            let reason = crate::paste::check(
+                text,
+                mode.contains(TermMode::BRACKETED_PASTE),
+                mode.contains(TermMode::ALT_SCREEN),
+            );
+            if let Some(reason) = reason {
+                self.confirm = Some(Confirm {
+                    text: text.to_string(),
+                    reason,
+                });
+                self.dirty = true;
+                return;
+            }
+        }
+        self.paste_now(text);
+    }
+
+    /// Keys while a paste waits: Enter pastes it, Esc (or Ctrl+C) drops it.
+    fn confirm_key(&mut self, sym: u32, ctrl: bool) {
+        match sym {
+            0xff0d | 0xff8d => {
+                if let Some(c) = self.confirm.take() {
+                    self.paste_now(&c.text);
+                }
+            }
+            0xff1b => self.confirm = None,
+            _ if ctrl && sym | 0x20 == 0x63 => self.confirm = None,
+            _ => return,
+        }
+        self.dirty = true;
+    }
+
+    fn paste_now(&mut self, text: &str) {
         let mode = self.mode();
         let clean = text
             .replace("\x1b[201~", "")
@@ -610,6 +696,9 @@ impl App {
         let alt = state.contains(KeyButMask::MOD1);
         if (0xffe1..=0xffee).contains(&sym) || sym == 0xfe03 || sym == 0xff7e {
             return; // modifier keys alone
+        }
+        if self.confirm.is_some() {
+            return self.confirm_key(sym, ctrl);
         }
         if self.hints.is_some() {
             return self.hint_key(sym);
@@ -916,7 +1005,8 @@ impl App {
         let hint = h.list.swap_remove(i).1;
         self.hints = None;
         if c.is_ascii_uppercase() {
-            return self.paste(&hint.text);
+            // Text from the screen, a link or a path: no need to ask.
+            return self.paste_now(&hint.text);
         }
         match hint.target {
             crate::text::Target::Url(u) => crate::open::xdg_open(&u),
@@ -1363,11 +1453,43 @@ impl App {
                 );
             }
         }
-        for c in &cells {
+        let ligatures = self.fonts.ligatures();
+        // Cells up to this index were drawn as part of a joined run; runs
+        // are looked at once, from their first cell.
+        let mut joined_until = 0;
+        let mut looked_until = 0;
+        let mut run = String::new();
+        for (i, c) in cells.iter().enumerate() {
             let (x, y) = (pad + c.col * cw, pad + c.row * ch);
             let span = if c.wide { 2 } else { 1 };
-            self.fonts
-                .draw(&mut self.cv, x, y, c.c, c.style, c.fg, span);
+            if ligatures && i >= looked_until && crate::font::joins(c.c) && c.extra.is_none() {
+                // The run of punctuation in the same colour and style.
+                run.clear();
+                run.push(c.c);
+                let mut j = i + 1;
+                while let Some(n) = cells.get(j) {
+                    let prev = &cells[j - 1];
+                    if n.row != c.row
+                        || n.col != prev.col + 1
+                        || n.fg != c.fg
+                        || n.style != c.style
+                        || n.extra.is_some()
+                        || !crate::font::joins(n.c)
+                    {
+                        break;
+                    }
+                    run.push(n.c);
+                    j += 1;
+                }
+                looked_until = j;
+                if j - i >= 2 && self.fonts.draw_run(&mut self.cv, x, y, &run, c.style, c.fg) {
+                    joined_until = j;
+                }
+            }
+            if i >= joined_until {
+                self.fonts
+                    .draw(&mut self.cv, x, y, c.c, c.style, c.fg, span);
+            }
             if let Some(extra) = &c.extra {
                 for z in extra {
                     self.fonts.draw(&mut self.cv, x, y, *z, c.style, c.fg, span);
@@ -1411,8 +1533,9 @@ impl App {
             .session
             .graphics
             .lock()
-            .map(|g| (g.placements.clone(), g.images.clone()));
-        if let Ok((places, images)) = placements {
+            .map(|g| (g.placements.clone(), g.images.clone()))
+            .ok();
+        if let Some((places, images)) = placements {
             self.cv.set_clip(Rect::new(
                 pad,
                 pad,
@@ -1542,6 +1665,9 @@ impl App {
                 self.fonts.draw(&mut self.cv, x, y, c, 0, pal.fg, 1);
             }
         }
+        if self.confirm.is_some() {
+            self.draw_confirm();
+        }
         // A message, or the history position while scrolled back, top right.
         let label = match &self.toast {
             Some((t, _)) => Some(t.clone()),
@@ -1568,6 +1694,171 @@ impl App {
             self.cv.tint(Rect::new(0, 0, w, h), pal.fg, 28);
         }
     }
+}
+
+impl App {
+    /// Text in cells from (x, y), cut with an ellipsis after `max` cells;
+    /// returns the cells used.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text(
+        &mut self,
+        x: i32,
+        y: i32,
+        text: &str,
+        style: u8,
+        color: u32,
+        max: usize,
+    ) -> usize {
+        let cw = self.fonts.cell_w;
+        let total: usize = text.chars().map(cell_width).sum();
+        let room = if total > max {
+            max.saturating_sub(1)
+        } else {
+            max
+        };
+        let mut used = 0;
+        let mut last = x;
+        for c in text.chars() {
+            let n = cell_width(c);
+            if n == 0 {
+                self.fonts.draw(&mut self.cv, last, y, c, style, color, 1);
+                continue;
+            }
+            if used + n > room {
+                break;
+            }
+            last = x + used as i32 * cw;
+            self.fonts
+                .draw(&mut self.cv, last, y, c, style, color, n as i32);
+            used += n;
+        }
+        if total > max && max > 0 {
+            self.fonts
+                .draw(&mut self.cv, x + used as i32 * cw, y, '…', style, color, 1);
+            used += 1;
+        }
+        used
+    }
+
+    /// The paste confirmation: a box in the middle of the window with the
+    /// reason, the first lines of the paste and the keys.
+    fn draw_confirm(&mut self) {
+        let Some(c) = &self.confirm else { return };
+        let pal = self.pal.clone();
+        let (cw, ch) = (self.fonts.cell_w, self.fonts.cell_h);
+        let (w, h) = (self.cv.w, self.cv.h);
+        const SHOWN: usize = 6;
+        let (lines, total) = crate::paste::preview(&c.text, SHOWN);
+        let danger = c.reason.danger.is_some();
+        let sentence = c.reason.sentence();
+        let title = match total {
+            1 => "Paste this line?".to_string(),
+            n => format!("Paste {n} lines?"),
+        };
+        let more = total.saturating_sub(lines.len());
+        // The box: as wide as the longest line, within the window.
+        let fit = ((w / cw) as usize).saturating_sub(4).max(10);
+        let longest = lines
+            .iter()
+            .map(|l| l.chars().map(cell_width).sum::<usize>() + 4)
+            .chain([title.chars().count() + 4, 50])
+            .max()
+            .unwrap_or(50);
+        let inner = longest.clamp(50, 80).min(fit);
+        let words = wrap(&sentence, inner);
+        let accent = if danger { pal.ansi[1] } else { pal.ansi[3] };
+        let surface = crate::canvas::mix(pal.bg, pal.fg, 0.07);
+        let dim = crate::canvas::mix(pal.fg, surface, 0.45);
+        let gap = ch / 2;
+        let rows = 1 + words.len() + lines.len() + usize::from(more > 0) + 1;
+        let bw = (inner as i32 + 2) * cw;
+        let bh = rows as i32 * ch + 5 * gap;
+        let x0 = ((w - bw) / 2).max(0);
+        let y0 = ((h - bh) / 2).max(0);
+        // The terminal behind is dimmed, so the box stands out.
+        self.cv.tint(Rect::new(0, 0, w, h), pal.bg, 150);
+        let border = (ch / 12).max(2);
+        self.cv.fill(
+            Rect::new(x0 - border, y0 - border, bw + 2 * border, bh + 2 * border),
+            accent,
+        );
+        self.cv.fill(Rect::new(x0, y0, bw, bh), surface);
+        // Title bar.
+        self.cv.fill(Rect::new(x0, y0, bw, ch + gap), accent);
+        let tx = x0 + cw;
+        let mut y = y0 + gap / 2;
+        self.draw_text(tx, y, &title, 1, pal.bg, inner);
+        y += ch + gap + gap / 2;
+        for l in &words {
+            self.draw_text(tx, y, l, 0, pal.fg, inner);
+            y += ch;
+        }
+        y += gap;
+        // The paste itself on the terminal background, with a bar in the
+        // accent colour at its left.
+        let ph = (lines.len() as i32 + i32::from(more > 0)) * ch;
+        self.cv
+            .fill(Rect::new(tx, y, inner as i32 * cw, ph), pal.bg);
+        self.cv.fill(Rect::new(tx, y, (cw / 4).max(2), ph), accent);
+        for l in &lines {
+            self.draw_text(tx + cw, y, l, 0, pal.fg, inner - 2);
+            y += ch;
+        }
+        if more > 0 {
+            let s = format!("and {more} more line{}", if more == 1 { "" } else { "s" });
+            self.draw_text(tx + cw, y, &s, 2, dim, inner - 2);
+            y += ch;
+        }
+        y += gap;
+        let mut x = tx;
+        for (k, (key, what)) in [("Enter", " paste"), ("Esc", " cancel")].iter().enumerate() {
+            if k > 0 {
+                x += 3 * cw;
+            }
+            let n = self.draw_text(x, y, key, 1, accent, inner);
+            x += n as i32 * cw;
+            let n = self.draw_text(x, y, what, 0, dim, inner);
+            x += n as i32 * cw;
+        }
+    }
+}
+
+/// Cells a character takes in the confirmation box: 2 for East Asian wide
+/// characters and emoji, 0 for combining marks.
+fn cell_width(c: char) -> usize {
+    match c as u32 {
+        0x0300..=0x036f | 0x200b..=0x200f | 0xfe00..=0xfe0f => 0,
+        0x1100..=0x115f
+        | 0x2e80..=0xa4cf
+        | 0xac00..=0xd7a3
+        | 0xf900..=0xfaff
+        | 0xfe30..=0xfe4f
+        | 0xff00..=0xff60
+        | 0xffe0..=0xffe6
+        | 0x1f300..=0x1f64f
+        | 0x1f900..=0x1f9ff
+        | 0x20000..=0x3fffd => 2,
+        _ => 1,
+    }
+}
+
+/// Words in lines of at most `width` characters.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
 }
 
 /// ARGB window icons: a pixel ">_" prompt on the theme background.

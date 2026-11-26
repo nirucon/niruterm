@@ -3,9 +3,30 @@
 //! fontconfig), and glyph masks cached per (character, style). Box drawing,
 //! block elements and powerline arrows are drawn as exact pixels instead, so
 //! lines join cell to cell without gaps at any size.
+//!
+//! Programming ligatures (`->`, `!=`, `=>`, `===`, `&&`) are optional
+//! (`ligatures = true`). Runs of ASCII punctuation in one colour and style
+//! are shaped with rustybuzz (the font's `calt` and `liga` rules) and drawn
+//! glyph by glyph on their own cells, so the grid never moves. Letters are
+//! never joined: `fi` stays two letters, as a terminal expects.
 use crate::canvas::{Canvas, Rect};
-use ab_glyph::{point, Font, FontArc, PxScale, ScaleFont};
+use ab_glyph::{point, Font, FontArc, FontRef, GlyphId, PxScale, ScaleFont};
 use std::collections::HashMap;
+use std::rc::Rc;
+
+/// One glyph of a shaped run: the cell it starts in, the glyph, and its
+/// offset from the cell in font units.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shaped {
+    pub cell: u16,
+    pub glyph: u16,
+    pub dx: f32,
+    pub dy: f32,
+}
+
+/// Runs shaped so far, by text and style; None when the font changes
+/// nothing (the run is drawn character by character).
+type ShapeCache = HashMap<(String, u8), Option<Rc<Vec<Shaped>>>>;
 
 pub struct Mask {
     pub w: i32,
@@ -17,6 +38,12 @@ pub struct Mask {
 
 pub struct Fonts {
     faces: [FontArc; 4],
+    /// The font files of the four faces, kept for the shaper.
+    data: [&'static [u8]; 4],
+    /// The shapers, when ligatures are on.
+    shapers: Option<Vec<rustybuzz::Face<'static>>>,
+    shaped: ShapeCache,
+    glyphs: HashMap<(u16, u8), Option<Mask>>,
     fallback: HashMap<char, Option<FontArc>>,
     loaded: HashMap<String, FontArc>,
     cache: HashMap<(char, u8), Option<Mask>>,
@@ -42,6 +69,13 @@ fn open(path: &str) -> Option<FontArc> {
     FontArc::try_from_vec(std::fs::read(path).ok()?).ok()
 }
 
+/// A main face, its bytes kept for the life of the program (the four faces
+/// are opened once), so the shaper can read the same file without a copy.
+fn open_static(path: &str) -> Option<(FontArc, &'static [u8])> {
+    let data: &'static [u8] = Box::leak(std::fs::read(path).ok()?.into_boxed_slice());
+    Some((FontArc::new(FontRef::try_from_slice(data).ok()?), data))
+}
+
 /// Pixels per point from Xft.dpi when set, else 96 dpi.
 pub fn dpi_scale(xft_dpi: Option<f32>) -> f32 {
     xft_dpi.unwrap_or(96.0) / 72.0
@@ -56,27 +90,33 @@ impl Fonts {
     ) -> Result<Self, String> {
         let family = family.unwrap_or(DEFAULT_FAMILY).to_string();
         let mut loaded: HashMap<String, FontArc> = HashMap::new();
-        let mut face = |style: &str| -> Result<FontArc, String> {
+        let mut bytes: HashMap<String, &'static [u8]> = HashMap::new();
+        let mut face = |style: &str| -> Result<(FontArc, &'static [u8]), String> {
             let pattern = format!("{family}:style={style}");
             let path = fc_match(&pattern)
                 .or_else(|| fc_match("monospace"))
                 .or_else(|| Some("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf".into()))
                 .unwrap();
-            if let Some(f) = loaded.get(&path) {
-                return Ok(f.clone());
+            if let (Some(f), Some(d)) = (loaded.get(&path), bytes.get(&path)) {
+                return Ok((f.clone(), d));
             }
-            let f = open(&path).ok_or_else(|| format!("cannot open font {path}"))?;
-            loaded.insert(path, f.clone());
-            Ok(f)
+            let (f, d) = open_static(&path).ok_or_else(|| format!("cannot open font {path}"))?;
+            loaded.insert(path.clone(), f.clone());
+            bytes.insert(path, d);
+            Ok((f, d))
         };
-        let faces = [
+        let (r, b, i, bi) = (
             face("Regular")?,
             face("Bold")?,
             face("Italic")?,
             face("Bold Italic")?,
-        ];
+        );
         let mut f = Fonts {
-            faces,
+            faces: [r.0, b.0, i.0, bi.0],
+            data: [r.1, b.1, i.1, bi.1],
+            shapers: None,
+            shaped: HashMap::new(),
+            glyphs: HashMap::new(),
             fallback: HashMap::new(),
             loaded,
             cache: HashMap::new(),
@@ -99,6 +139,76 @@ impl Fonts {
         self.ascent =
             (s.ascent() + (h - (s.ascent() - s.descent() + s.line_gap())) / 2.0).round() as i32;
         self.cache.clear();
+        self.glyphs.clear();
+    }
+
+    /// Turns programming ligatures on or off.
+    pub fn set_ligatures(&mut self, on: bool) {
+        if on == self.shapers.is_some() {
+            return;
+        }
+        self.shaped.clear();
+        self.shapers = if on {
+            self.data
+                .iter()
+                .map(|d| rustybuzz::Face::from_slice(d, 0))
+                .collect::<Option<Vec<_>>>()
+        } else {
+            None
+        };
+    }
+
+    pub fn ligatures(&self) -> bool {
+        self.shapers.is_some()
+    }
+
+    /// The glyphs of a run when the font joins some of it, else None.
+    pub fn shape(&mut self, text: &str, style: u8) -> Option<Rc<Vec<Shaped>>> {
+        let style = style & 3;
+        let key = (text.to_string(), style);
+        if let Some(hit) = self.shaped.get(&key) {
+            return hit.clone();
+        }
+        let face = self.shapers.as_ref()?.get(style as usize)?;
+        let found = shape_run(face, &self.faces[style as usize], text);
+        if self.shaped.len() > 4096 {
+            self.shaped.clear();
+        }
+        self.shaped.insert(key, found.clone());
+        found
+    }
+
+    /// Draws a run of characters, one per cell from (x, y), with the font's
+    /// ligatures. Returns false when the font joins nothing in it, and the
+    /// caller draws the characters one by one.
+    pub fn draw_run(
+        &mut self,
+        cv: &mut Canvas,
+        x: i32,
+        y: i32,
+        text: &str,
+        style: u8,
+        color: u32,
+    ) -> bool {
+        let Some(glyphs) = self.shape(text, style) else {
+            return false;
+        };
+        let style = style & 3;
+        let face = self.faces[style as usize].clone();
+        let units = face.as_scaled(PxScale::from(self.px)).h_scale_factor();
+        for g in glyphs.iter() {
+            let key = (g.glyph, style);
+            if !self.glyphs.contains_key(&key) {
+                let m = mask(&face, GlyphId(g.glyph), self.px);
+                self.glyphs.insert(key, m);
+            }
+            if let Some(Some(m)) = self.glyphs.get(&key) {
+                let gx = x + g.cell as i32 * self.cell_w + (g.dx * units).round() as i32;
+                let gy = y + self.ascent - (g.dy * units).round() as i32;
+                cv.mask(gx + m.x, gy + m.y, m.w, m.h, &m.coverage, color);
+            }
+        }
+        true
     }
 
     fn face_for(&mut self, c: char, style: u8) -> Option<FontArc> {
@@ -169,32 +279,81 @@ impl Fonts {
         if adv > room * 1.05 {
             px *= room / adv;
         }
-        let glyph = face
-            .glyph_id(c)
-            .with_scale_and_position(PxScale::from(px), point(0.0, 0.0));
-        let outline = face.outline_glyph(glyph)?;
-        let b = outline.px_bounds();
-        let (w, h) = (b.width().ceil() as i32, b.height().ceil() as i32);
-        if w <= 0 || h <= 0 {
-            return None;
-        }
-        let mut coverage = vec![0u8; (w * h) as usize];
-        outline.draw(|gx, gy, v| {
-            let i = (gy as i32 * w + gx as i32) as usize;
-            if i < coverage.len() {
-                coverage[i] = (v * 255.0).round().clamp(0.0, 255.0) as u8;
-            }
-        });
         // Synthetic bold for a family without a bold face is not needed:
         // fontconfig returns the regular face, which stays readable.
-        Some(Mask {
-            w,
-            h,
-            x: b.min.x.floor() as i32,
-            y: b.min.y.floor() as i32,
-            coverage,
-        })
+        mask(&face, face.glyph_id(c), px)
     }
+}
+
+/// The coverage mask of one glyph at a pixel size.
+fn mask(face: &FontArc, id: GlyphId, px: f32) -> Option<Mask> {
+    let glyph = id.with_scale_and_position(PxScale::from(px), point(0.0, 0.0));
+    let outline = face.outline_glyph(glyph)?;
+    let b = outline.px_bounds();
+    let (w, h) = (b.width().ceil() as i32, b.height().ceil() as i32);
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let mut coverage = vec![0u8; (w * h) as usize];
+    outline.draw(|gx, gy, v| {
+        let i = (gy as i32 * w + gx as i32) as usize;
+        if i < coverage.len() {
+            coverage[i] = (v * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    });
+    Some(Mask {
+        w,
+        h,
+        x: b.min.x.floor() as i32,
+        y: b.min.y.floor() as i32,
+        coverage,
+    })
+}
+
+/// Characters that may be joined: the ASCII punctuation programming
+/// ligatures are made of.
+pub fn joins(c: char) -> bool {
+    c.is_ascii_punctuation()
+}
+
+/// Shapes a run of ASCII punctuation. None when every character keeps its
+/// own glyph in place (nothing to join).
+fn shape_run(face: &rustybuzz::Face, plain: &FontArc, text: &str) -> Option<Rc<Vec<Shaped>>> {
+    if text.len() < 2 || !text.chars().all(joins) {
+        return None;
+    }
+    let mut buf = rustybuzz::UnicodeBuffer::new();
+    buf.push_str(text);
+    buf.set_direction(rustybuzz::Direction::LeftToRight);
+    buf.set_script(rustybuzz::script::LATIN);
+    let out = rustybuzz::shape(face, &[], buf);
+    let (infos, pos) = (out.glyph_infos(), out.glyph_positions());
+    let same = infos.len() == text.len()
+        && infos.iter().zip(pos).zip(text.chars()).all(|((i, p), c)| {
+            i.glyph_id as u16 == plain.glyph_id(c).0 && p.x_offset == 0 && p.y_offset == 0
+        });
+    if same {
+        return None;
+    }
+    // Each glyph is placed on the cell of its character (the text is ASCII,
+    // so a cluster is a cell); glyphs that share a cell follow each other.
+    let mut glyphs = Vec::with_capacity(infos.len());
+    let mut last = u32::MAX;
+    let mut pen = 0.0;
+    for (i, p) in infos.iter().zip(pos) {
+        if i.cluster != last {
+            last = i.cluster;
+            pen = 0.0;
+        }
+        glyphs.push(Shaped {
+            cell: i.cluster as u16,
+            glyph: i.glyph_id as u16,
+            dx: pen + p.x_offset as f32,
+            dy: p.y_offset as f32,
+        });
+        pen += p.x_advance as f32;
+    }
+    Some(Rc::new(glyphs))
 }
 
 /// Box drawing (U+2500..257F), blocks (U+2580..259F) and powerline arrows
@@ -363,6 +522,43 @@ mod tests {
         assert!(draw_special(&mut cv, 0, 0, 10, 20, '│', 0xffffff));
         assert_eq!(cv.px[4].max(cv.px[5]), 0xffffff);
         assert!(!draw_special(&mut cv, 0, 0, 10, 20, 'a', 0xffffff));
+    }
+
+    fn faces(path: &std::ffi::OsStr) -> (rustybuzz::Face<'static>, FontArc) {
+        let data: &'static [u8] = Box::leak(std::fs::read(path).unwrap().into_boxed_slice());
+        (
+            rustybuzz::Face::from_slice(data, 0).unwrap(),
+            FontArc::new(FontRef::try_from_slice(data).unwrap()),
+        )
+    }
+
+    #[test]
+    fn a_font_without_ligatures_leaves_every_run_alone() {
+        let path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf";
+        if !std::path::Path::new(path).is_file() {
+            return;
+        }
+        let (face, plain) = faces(path.as_ref());
+        for run in ["->", "!=", "===", "<=>", "//"] {
+            assert_eq!(shape_run(&face, &plain, run), None, "{run}");
+        }
+    }
+
+    /// With `NIRUTERM_LIGATURE_FONT=/path/JetBrainsMono-Regular.ttf` (or
+    /// Fira Code): operators are joined, every glyph stays on the cells of
+    /// its run, and letters are never shaped.
+    #[test]
+    fn a_programming_font_joins_operators_on_their_own_cells() {
+        let Some(path) = std::env::var_os("NIRUTERM_LIGATURE_FONT") else {
+            return;
+        };
+        let (face, plain) = faces(&path);
+        for run in ["->", "=>", "!=", "===", "<=", "&&", "</>"] {
+            let g = shape_run(&face, &plain, run).unwrap_or_else(|| panic!("{run} not joined"));
+            assert!(g.iter().all(|s| (s.cell as usize) < run.len()), "{run}");
+        }
+        assert_eq!(shape_run(&face, &plain, "fi"), None);
+        assert_eq!(shape_run(&face, &plain, "a"), None);
     }
 
     #[test]

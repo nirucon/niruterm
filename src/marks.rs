@@ -384,7 +384,7 @@ mod tests {
                 crate::graphics::Piece::Text(t) => pieces.push((false, t.to_vec())),
                 crate::graphics::Piece::Owned(t) => pieces.push((false, t)),
                 crate::graphics::Piece::Mark(m) => pieces.push((true, m)),
-                crate::graphics::Piece::Command(_) => {}
+                crate::graphics::Piece::Command(_) | crate::graphics::Piece::Cwd(_) => {}
             });
             for (mark, p) in pieces {
                 if mark {
